@@ -24,6 +24,15 @@ spring:
       load-on-startup: 1
 
 
+# Web 容器：为秒杀瞬时洪峰预留线程与连接余量（默认 threads.max=200 / accept-count=100）
+server:
+  tomcat:
+    threads:
+      max: 500
+    max-connections: 8192
+    accept-count: 1000
+
+
 mybatis-plus:
   type-aliases-package: com.hmdp.entity # 别名扫描包
   configuration:
@@ -34,4 +43,17 @@ logging:
   level:
     com.hmdp: debug
 
+
+# RocketMQ（Windows 本机 NameServer，部署步骤见 docs/ROCKETMQ-DEPLOY.md）
+# 注意：引入 starter 后应用启动即连接 NameServer，必须先启动 RocketMQ 再启动应用
+rocketmq:
+  name-server: 127.0.0.1:9876
+  producer:
+    group: seckill-producer-group
+    send-message-timeout: 3000
+
+
+# 秒杀写策略开关：A=事务消息（默认，扣库存与消息强绑定）；B=普通消息+消费者claim（超大流量削峰）
+seckill:
+  mode: A
 
