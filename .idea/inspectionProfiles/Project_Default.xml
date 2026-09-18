@@ -1,0 +1,30 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="SerializableHasSerialVersionUIDField" enabled="true" level="WARNING" enabled_by_default="true" />
+    <inspection_tool class="VulnerableLibrariesLocal" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="isIgnoringEnabled" value="true" />
+      <option name="ignoredModules">
+        <list>
+          <option value="hm-dianping" />
+          <option value="hm-dianping" />
+          <option value="hm-dianping" />
+        </list>
+      </option>
+      <option name="ignoredPackages">
+        <list>
+          <option value="org.springframework.boot:spring-boot:2.3.12.RELEASE" />
+          <option value="org.springframework.boot:spring-boot:3.2.10" />
+          <option value="net.minidev:json-smart:2.5.1" />
+        </list>
+      </option>
+      <option name="ignoredReasons">
+        <list>
+          <option value="不可利用" />
+          <option value="不可利用" />
+          <option value="进行中" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
