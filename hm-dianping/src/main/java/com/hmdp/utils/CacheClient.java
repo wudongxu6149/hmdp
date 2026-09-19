@@ -82,7 +82,7 @@ public class CacheClient {
                                            Long expireTime, TimeUnit unit) {
 
         String cacheKey = keyPrefix + id.toString();
-        String lockKey = LOCK_SHOP_KEY + id.toString();
+        String lockKey = LOCK_SHOP_KEY + id;
 
         // 1. 先查缓存，判断缓存是否命中，如果未命中直接返回空
         String json = stringRedisTemplate.opsForValue().get(cacheKey);

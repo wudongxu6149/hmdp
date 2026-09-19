@@ -1,6 +1,4 @@
 --[[ 【阶段2 全量重写 / 阶段4 简化】秒杀资格判定脚本
-  在事务消息的本地事务内执行（SeckillTxListener → SeckillScript.execute）。
-  （原策略B"消费者 claim + writeTx 参数"的双策略设计已移除，需要时从 git 历史找回）
 
   原子能力：时间窗校验 → 库存校验 → 一人一单 → 扣库存 → 记资格 → 写事务标记
   相比旧版：① 补上秒杀时间窗校验（旧版未开始也能抢）；② 删除 XADD stream.orders（Stream 链路废弃）；

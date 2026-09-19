@@ -20,6 +20,8 @@ public class RedisConstants {
     public static final String SECKILL_ORDER_KEY = "seckill:order:";
     public static final String SECKILL_TX_KEY = "seckill:tx:";
     public static final String SECKILL_RESULT_KEY = "seckill:result:";
+    /* 【阶段4新增】Redis 库存退票幂等标记：seckill:refund:{orderId}，防同一消息重放导致重复回补 */
+    public static final String SECKILL_REFUND_KEY = "seckill:refund:";
 
     public static final String BLOG_LIKED_KEY = "blog:liked:";
     public static final String FEED_KEY = "feed:";

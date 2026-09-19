@@ -4,7 +4,6 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.SeckillMessage;
 import com.hmdp.dto.UserDTO;
-import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.mq.SeckillResultStore;
@@ -18,8 +17,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
-import org.springframework.dao.DuplicateKeyException;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.messaging.Message;
 import org.springframework.messaging.support.MessageBuilder;
@@ -30,9 +29,8 @@ import javax.annotation.Resource;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.util.concurrent.TimeUnit;
 
-import static com.hmdp.utils.MQConstants.*;
+import static com.hmdp.utils.MQConstants.TOPIC_SECKILL_ORDER;
 import static com.hmdp.utils.RedisConstants.*;
 
 /**
@@ -149,10 +147,13 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         lock.lock();
         try {
             // L2 业务查重：已有【有效订单】（active_flag=0）→ 本消息按重复下单终态化。
-            // 已取消的历史单不占位——这是方案A"取消后可重抢"的语义
+            // 已取消的历史单不占位——这是方案A"取消后可重抢"的语义。
+            // 【阶段4补漏】Lua 已为本消息预扣了 Redis 库存，但本消息注定不会产生订单（幻影扣减），
+            // 必须退票：只退库存、不 SREM 资格——用户的资格由其已有有效订单合法持有
             int count = query().eq("user_id", userId).eq("voucher_id", voucherId).eq("active_flag", 0).count();
             if (count > 0) {
-                log.info("[查重命中] userId={}, voucherId={} 已有有效订单", userId, voucherId);
+                log.info("[查重命中] userId={}, voucherId={} 已有有效订单, 退回幻影预扣库存", userId, voucherId);
+                refundRedisStockOnce(orderId, voucherId);
                 seckillResultStore.mark(orderId, "FAILED:请勿重复下单");
                 return;
             }
@@ -164,9 +165,11 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     .update();
             if (!success) {
                 // 【数据漂移】Redis 判定有资格但 DB 库存不足：回补 Redis 库存 + 解除资格 + 终态化 + 告警，
-                // 不重试（重试无法修复漂移），漂移根因由阶段4的对账任务定位
+                // 不重试（重试无法修复漂移），漂移根因由阶段4的对账任务定位。
+                // 【阶段4补漏】回补走幂等退票（setIfAbsent 门闩），防同一消息并发重放导致库存重复+1；
+                // SREM 幂等故无需门闩——此处释放资格是因为资格背后没有库存支撑，用户应可重试
                 log.error("[库存漂移] Redis/DB 库存不一致, orderId={}, voucherId={}", orderId, voucherId);
-                stringRedisTemplate.opsForHash().increment(SECKILL_VOUCHER_KEY + voucherId, "stock", 1);
+                refundRedisStockOnce(orderId, voucherId);
                 stringRedisTemplate.opsForSet().remove(SECKILL_ORDER_KEY + voucherId, userId.toString());
                 seckillResultStore.mark(orderId, "FAILED:库存不足");
                 return;
@@ -218,7 +221,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             log.warn("[DLQ] 订单已存在，无需补偿, orderId={}", orderId);
             return;
         }
-        stringRedisTemplate.opsForHash().increment(SECKILL_VOUCHER_KEY + voucherId, "stock", 1);
+        // 【阶段4补漏】回补走幂等退票（防 DLQ 消息重放导致库存重复+1）；SREM 幂等无需门闩
+        refundRedisStockOnce(orderId, voucherId);
         stringRedisTemplate.opsForSet().remove(SECKILL_ORDER_KEY + voucherId, userId.toString());
         seckillResultStore.mark(orderId, "FAILED:落库失败已回补");
         log.error("[DLQ补偿] 订单落库最终失败，已回补库存与资格, orderId={}, userId={}, voucherId={}",
@@ -395,5 +399,20 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      */
     private long toEpochMilli(LocalDateTime time) {
         return time.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+    }
+
+    /**
+     * 【阶段4补漏】幂等退票：把本消息在 Lua 中预扣的 Redis 库存 +1 回去。
+     * 用 setIfAbsent 门闩（seckill:refund:{orderId}，TTL 1天）保证同一 orderId 只退一次——
+     * 消息重放/并发重投时不会重复加库存。三个调用方：查重命中（幻影扣减退回）、
+     * 库存漂移（回补+释放资格）、死信补偿（最终失败回补）。
+     * 注意：只退库存不释放资格——资格是否释放由各调用方按业务语义自行决定（SREM 幂等，无门闩风险）
+     */
+    private void refundRedisStockOnce(Long orderId, Long voucherId) {
+        Boolean first = stringRedisTemplate.opsForValue().setIfAbsent(
+                SECKILL_REFUND_KEY + orderId, "1", Duration.ofDays(1));
+        if (Boolean.TRUE.equals(first)) {
+            stringRedisTemplate.opsForHash().increment(SECKILL_VOUCHER_KEY + voucherId, "stock", 1);
+        }
     }
 }
