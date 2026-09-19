@@ -77,5 +77,10 @@ public class VoucherOrder implements Serializable {
      */
     private LocalDateTime updateTime;
 
+    /**
+     * 有效标记：0=有效订单；取消/超时关闭时置为订单id，退出唯一约束 uk_user_voucher_active
+     */
+    private Long activeFlag;
+
 
 }

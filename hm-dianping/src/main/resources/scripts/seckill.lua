@@ -1,38 +1,52 @@
---优惠券id
-local voucherId = ARGV[1]
+--[[ 【阶段2 全量重写 / 阶段4 简化】秒杀资格判定脚本
+  在事务消息的本地事务内执行（SeckillTxListener → SeckillScript.execute）。
+  （原策略B"消费者 claim + writeTx 参数"的双策略设计已移除，需要时从 git 历史找回）
 
---用户id
+  原子能力：时间窗校验 → 库存校验 → 一人一单 → 扣库存 → 记资格 → 写事务标记
+  相比旧版：① 补上秒杀时间窗校验（旧版未开始也能抢）；② 删除 XADD stream.orders（Stream 链路废弃）；
+           ③ key 全部改由 KEYS 传入（Redis Cluster 规范写法，预留集群迁移结构）
+
+  KEYS[1] 秒杀元数据 Hash  seckill:voucher:{voucherId}（stock/beginTime/endTime，新增秒杀券时预热）
+  KEYS[2] 一人一单资格 Set seckill:order:{voucherId}
+  KEYS[3] 事务标记         seckill:tx:{orderId}（供 Broker 回查）
+  ARGV[1] 当前毫秒时间戳（Java 传入，用于时间窗比较）
+  ARGV[2] userId
+]]
+local voucherKey = KEYS[1]
+local orderKey = KEYS[2]
+local txKey = KEYS[3]
 local userId = ARGV[2]
+local now = tonumber(ARGV[1])
 
---订单id
-local orderId=ARGV[3]
+-- 1.时间窗校验：修复旧版"秒杀未开始也能抢"的缺陷。
+--   元数据未预热（beginTime 为空）按未开始处理，避免脚本对 nil 比较报错
+local beginTime = tonumber(redis.call('hget', voucherKey, 'beginTime'))
+local endTime = tonumber(redis.call('hget', voucherKey, 'endTime'))
+if (not beginTime or now < beginTime) then
+    return 3
+end
+if (not endTime or now > endTime) then
+    return 4
+end
 
-
---1.数据的key
---1.1 库存key
-local stockKey = 'seckill:stock:' .. voucherId
---1.2用户key
-local orderKey = 'seckill:order:' .. voucherId
-
---2.业务
---2.1 判断库存是否充足
-if (tonumber(redis.call('get', stockKey)) <= 0) then
+-- 2.库存校验：不足或未预热均视为无货
+local stock = tonumber(redis.call('hget', voucherKey, 'stock'))
+if (not stock or stock <= 0) then
     return 1
 end
---2.2 判断用户是否下单
+
+-- 3.一人一单：资格 Set 内已存在该用户则拒绝（旧版逻辑保留）
 if (redis.call('SISMEMBER', orderKey, userId) == 1) then
-    --存在，说明重复下单
     return 2
 end
---2.3 扣减库存
-redis.call('incrby', stockKey, -1)
---3.4 下单
-redis.call('sadd', orderKey, userId)
---3.5当判断有资格进行下单后，发送消息到stream队列中
-redis.call('xadd','stream.orders','*'
-            ,'voucherId',voucherId
-            ,'userId',userId
-            ,'id',orderId)
 
---成功！
+-- 4.扣减库存 + 记资格（同一脚本内原子完成）
+redis.call('hincrby', voucherKey, 'stock', -1)
+redis.call('sadd', orderKey, userId)
+
+-- 5.事务标记：与上面的扣减在同一 Lua 内原子写入——
+--   标记存在 = Redis 已扣 = 消息必须投递（Broker 回查的唯一事实依据）；TTL 1天远大于回查窗口
+redis.call('set', txKey, '1', 'EX', 86400)
+
+-- 成功
 return 0

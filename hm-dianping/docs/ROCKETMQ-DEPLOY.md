@@ -54,16 +54,17 @@ mqbroker.cmd -n 127.0.0.1:9876 -c conf\broker.conf
 ## 6. 创建业务 Topic（新窗口）
 
 ```cmd
-mqadmin updateTopic -n 127.0.0.1:9876 -c DefaultCluster -t seckill_order_tx
 mqadmin updateTopic -n 127.0.0.1:9876 -c DefaultCluster -t seckill_order -r 8 -w 8
 mqadmin updateTopic -n 127.0.0.1:9876 -c DefaultCluster -t order_timeout -r 4 -w 4
 ```
 
 | Topic | 用途 | 队列数 |
 |---|---|---|
-| `seckill_order_tx` | 秒杀事务消息（半消息 + 回查） | 默认 |
-| `seckill_order` | 策略B 普通消息；**8 队列**供「按 userId 哈希选队列」，保证同一用户消息串行消费 | 8 |
-| `order_timeout` | 订单延迟关单（15 分钟） | 4 |
+| `seckill_order` | 秒杀订单落库：事务消息 COMMIT 后在此被消费（消费者组只有一个 → 死信链路只有一条）；8 队列为扩容预留 | 8 |
+| `order_timeout` | 订单超时关单（15 分钟精确延迟，**阶段3已启用，必建**） | 4 |
+
+> 说明：早期方案中的 `seckill_order_tx` 已取消（事务消息与普通消息共用 `seckill_order`）；
+> 原"策略B"已从代码中移除（见 git 历史），本表即最终形态。
 
 ## 7. 验证
 

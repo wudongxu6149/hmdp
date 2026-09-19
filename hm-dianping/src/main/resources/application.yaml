@@ -53,7 +53,3 @@ rocketmq:
     send-message-timeout: 3000
 
 
-# 秒杀写策略开关：A=事务消息（默认，扣库存与消息强绑定）；B=普通消息+消费者claim（超大流量削峰）
-seckill:
-  mode: A
-

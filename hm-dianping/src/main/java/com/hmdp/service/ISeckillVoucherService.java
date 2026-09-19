@@ -13,4 +13,10 @@ import com.baomidou.mybatisplus.extension.service.IService;
  */
 public interface ISeckillVoucherService extends IService<SeckillVoucher> {
 
+    /**
+     * 【阶段4新增】秒杀券元数据写入 Redis Hash（seckill:voucher:{id}：stock/beginTime/endTime）。
+     * 唯一写入点：新增秒杀券（VoucherServiceImpl）与启动预热（RedisPreHeatRunner）共用，
+     * 字段名与 seckill.lua 的 HGET 读取严格对应，防止两处各写一套造成漂移
+     */
+    void preHeatRedisMeta(SeckillVoucher seckillVoucher);
 }

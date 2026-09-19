@@ -7,10 +7,10 @@ import com.hmdp.entity.Voucher;
 import com.hmdp.mapper.VoucherMapper;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherService;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import com.hmdp.utils.RedisConstants.*;
 
 import javax.annotation.Resource;
 import java.util.List;
@@ -25,6 +25,7 @@ import static com.hmdp.utils.RedisConstants.*;
  * @author 虎哥
  * @since 2021-12-22
  */
+@Slf4j
 @Service
 public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> implements IVoucherService {
 
@@ -56,9 +57,10 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
         seckillVoucher.setEndTime(voucher.getEndTime());
         seckillVoucherService.save(seckillVoucher);
 
-        //把优惠券添加到缓存中（优化）
-        stringRedisTemplate.opsForValue().set(SECKILL_STOCK_KEY+voucher.getId(),voucher.getStock().toString());
-        System.out.println("写入秒杀券成功！");
+        // 预热秒杀元数据到 Redis Hash：stock 参与原子扣减，beginTime/endTime 供 Lua 校验秒杀时间窗。
+        // 【阶段4重构】Hash 写入下沉到 SeckillVoucherServiceImpl.preHeatRedisMeta（唯一写入点），
+        // 与启动预热（RedisPreHeatRunner）共用，字段定义不会两处漂移
+        seckillVoucherService.preHeatRedisMeta(seckillVoucher);
     }
 
 
