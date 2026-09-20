@@ -1,6 +1,7 @@
 package com.hmdp.controller;
 
 
+import com.hmdp.annotation.RateLimit;
 import com.hmdp.dto.Result;
 import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.service.IVoucherService;
@@ -27,6 +28,11 @@ public class VoucherOrderController {
         this.iVoucherOrderService=iVoucherOrderService;
     }
 
+    /**
+     * 【阶段6新增】用户维度滑动窗口限流：同一用户 10 秒内最多 10 次抢购请求（防刷接口），
+     * 超限抛 BizException 由全局异常处理器返回友好提示
+     */
+    @RateLimit(key = "seckill", window = 10, maxCount = 10, limitType = RateLimit.LimitType.USER)
     @PostMapping("seckill/{id}")
     public Result seckillVoucher(@PathVariable("id") Long voucherId) {
         return iVoucherOrderService.seckillVoucher(voucherId);

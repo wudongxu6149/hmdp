@@ -53,3 +53,10 @@ rocketmq:
     send-message-timeout: 3000
 
 
+# 秒杀可调参数（与代码 @Value 默认值一致；与 README-UPGRADE 第七节对应）。
+# pay-timeout-minutes 同时被两条关单路径读取：延迟消息主链路（handleOrderTimeout/tryCloseOrder）
+# 与对账扫表兜底（ReconciliationTask.closeTimeoutOrders），改这一处两条路径同步生效
+seckill:
+  pay-timeout-minutes: 15            # 支付超时（关单时长）；测试时可改 1
+  reconcile-initial-delay-ms: 30000  # 对账首轮延迟
+  reconcile-interval-ms: 60000       # 对账间隔

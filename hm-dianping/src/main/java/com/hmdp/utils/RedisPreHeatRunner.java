@@ -55,6 +55,8 @@ public class RedisPreHeatRunner {
      * 关键约束【只补缺失、不覆盖已存在】：
      * 活动进行中 Redis 库存可能低于 DB（请求已被 Lua 预扣、订单尚未落库），
      * 启动时若用 DB 无脑覆盖会造成 Redis 库存虚高；已存在 Hash 的一致性修正交给对账任务
+     *
+     * 预热只查询优惠券的存在性，而不会去查询券的信息是否正确，校对信息的任务交给定时任务完成
      */
     @EventListener(ApplicationReadyEvent.class)
     public void preHeatSeckillVouchers() {

@@ -19,8 +19,7 @@ import static com.hmdp.utils.RedisConstants.*;
 
 @Component
 @AllArgsConstructor
-public class
-RefreshTokenInterceptor implements HandlerInterceptor {
+public class RefreshTokenInterceptor implements HandlerInterceptor {
 
     private final StringRedisTemplate stringRedisTemplate;
 

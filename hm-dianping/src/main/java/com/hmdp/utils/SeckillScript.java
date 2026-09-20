@@ -35,8 +35,9 @@ public class SeckillScript {
      */
     public int execute(Long voucherId, Long userId, Long orderId) {
         // keys 以 KEYS 数组传入（而非在脚本内拼字符串）：这是 Redis Cluster 下 Lua 的规范写法，
-        // 单机版同样适用；真迁集群时同券的几个 key 需 hash tag 保证同 slot，此处已预留好结构。
+
         // voucherId/orderId 已编码在 KEYS[1..3] 中，无需再作为 ARGV 传递
+
         Long r = stringRedisTemplate.execute(
                 SECKILL_SCRIPT,
                 Arrays.asList(

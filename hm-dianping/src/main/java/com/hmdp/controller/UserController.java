@@ -2,6 +2,7 @@ package com.hmdp.controller;
 
 
 import cn.hutool.core.bean.BeanUtil;
+import com.hmdp.annotation.RateLimit;
 import com.hmdp.dto.LoginFormDTO;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.UserDTO;
@@ -38,7 +39,9 @@ public class UserController {
 
     /**
      * 发送手机验证码
+     * 【阶段6新增】IP 维度滑动窗口限流：防短信轰炸——同一 IP 每小时最多 10 次验证码请求
      */
+    @RateLimit(key = "sendCode", window = 3600, maxCount = 10, limitType = RateLimit.LimitType.IP)
     @PostMapping("code")
     public Result sendCode(@RequestParam(value = "phone",required = true) String phone, HttpSession session) {
         // TODO 发送短信验证码并保存验证码

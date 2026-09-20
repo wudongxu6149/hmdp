@@ -13,8 +13,8 @@
 local voucherKey = KEYS[1]
 local orderKey = KEYS[2]
 local txKey = KEYS[3]
-local userId = ARGV[2]
 local now = tonumber(ARGV[1])
+local userId = ARGV[2]
 
 -- 1.时间窗校验：修复旧版"秒杀未开始也能抢"的缺陷。
 --   元数据未预热（beginTime 为空）按未开始处理，避免脚本对 nil 比较报错

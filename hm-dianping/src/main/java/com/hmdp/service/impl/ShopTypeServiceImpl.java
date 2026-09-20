@@ -2,12 +2,11 @@ package com.hmdp.service.impl;
 
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
-import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
-import com.hmdp.entity.Shop;
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.github.benmanes.caffeine.cache.Cache;
 import com.hmdp.entity.ShopType;
 import com.hmdp.mapper.ShopTypeMapper;
 import com.hmdp.service.IShopTypeService;
-import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -23,38 +22,39 @@ import static com.hmdp.utils.RedisConstants.CACHE_SHOP_TYPE;
  *  服务实现类
  * </p>
  *
- * @author 虎哥
- * @since 2021-12-22
+ * 【阶段5重构】商铺类型列表接入多级缓存：L1 Caffeine → L2 Redis → DB。
+ * 类型是变更极少的字典数据，最适合本地缓存——热点读几乎不再出应用进程
  */
 @Service
 @RequiredArgsConstructor
 public class ShopTypeServiceImpl extends ServiceImpl<ShopTypeMapper, ShopType> implements IShopTypeService {
 
     private final StringRedisTemplate stringRedisTemplate;
+    /* 【阶段5新增】L1 本地缓存（CacheConfig 装配，key 与 L2 一致便于失效对齐） */
+    private final Cache<String, String> localCache;
 
     @Override
     public List<ShopType> queryTypeList() {
-        //1.先从redis中查找
-        String shopTypeJson = stringRedisTemplate.opsForValue().get(CACHE_SHOP_TYPE);
-        //2.判断是否为空
-        if(StrUtil.isNotBlank(shopTypeJson)){
-            //如果不为空就转换成集合返回
-            return JSONUtil.toList(shopTypeJson, ShopType.class);
+        // 1.【阶段5新增】L1 本地缓存命中直接返回（不打 Redis）
+        String l1Json = localCache.getIfPresent(CACHE_SHOP_TYPE);
+        if (StrUtil.isNotBlank(l1Json)) {
+            return JSONUtil.toList(l1Json, ShopType.class);
         }
-
-        //3.如果没查到，就需要从数据库中查询然后添加到redis中,并设置过期时间
+        // 2. L2 Redis：命中后回填 L1（存原始 JSON，与 L2 同源同形态）
+        String shopTypeJson = stringRedisTemplate.opsForValue().get(CACHE_SHOP_TYPE);
+        if (StrUtil.isNotBlank(shopTypeJson)) {
+            List<ShopType> shopTypes = JSONUtil.toList(shopTypeJson, ShopType.class);
+            localCache.put(CACHE_SHOP_TYPE, shopTypeJson);
+            return shopTypes;
+        }
+        // 3. DB 兜底，写回两级
         List<ShopType> shopTypes = query().orderByAsc("sort").select().list();
-
-
-        if(shopTypes==null || shopTypes.isEmpty()){
+        if (shopTypes == null || shopTypes.isEmpty()) {
             return null;
         }
-        stringRedisTemplate.opsForValue().set(
-                CACHE_SHOP_TYPE,
-                JSONUtil.toJsonStr(shopTypes),
-                CACHE_SHOP_TTL,
-                TimeUnit.MINUTES);
+        shopTypeJson = JSONUtil.toJsonStr(shopTypes);
+        stringRedisTemplate.opsForValue().set(CACHE_SHOP_TYPE, shopTypeJson, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        localCache.put(CACHE_SHOP_TYPE, shopTypeJson);
         return shopTypes;
-
     }
 }

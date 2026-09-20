@@ -14,7 +14,6 @@ public final class MQConstants {
      * 消费者组只有一个 → 死信链路也只有一条（%DLQ% + 消费者组），
      * 避免为每个 topic 重复写一套消费者 + 死信补偿。
      * 事务消息的半消息对消费者不可见，COMMIT 后才成为普通消息被消费。
-     * （原策略A/B双写策略设计已移除策略B，事务消息为唯一写策略）
      */
     public static final String TOPIC_SECKILL_ORDER = "seckill_order";
 

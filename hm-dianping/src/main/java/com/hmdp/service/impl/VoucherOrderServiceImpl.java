@@ -35,12 +35,12 @@ import static com.hmdp.utils.RedisConstants.*;
 
 /**
  * 服务实现类
- *
+ * <p>
  * 【阶段2 重构总览】秒杀写链路：Redis Stream（假 MQ）→ RocketMQ 事务消息。
  * 半消息 → 本地事务内执行秒杀 Lua（时间窗/库存/一人一单/预扣库存/记资格/写事务标记）
  * → 成功 COMMIT（消息必然可消费）；失败 ROLLBACK（Redis 原子，无残留）。
  * 「Redis 扣减」与「消息可消费」被绑成原子结果，修复旧链路"扣了库存消息丢了"的缺陷。
- *
+ * <p>
  * 消费者落库（SeckillOrderConsumer → landSeckillOrder）失败自动重试 16 次，
  * 仍失败由死信消费者（SeckillOrderDlqConsumer）回补库存与资格。
  * （原策略B"入口排队+消费者claim"双策略设计已简化移除，见 git 历史）
@@ -64,9 +64,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private SeckillResultStore seckillResultStore;
 
     /**
-     * 【阶段3新增】未支付订单超时关单时长（分钟）
+     * 【阶段3新增】未支付订单超时关单时长（分钟）。
+     * 【缺陷修复】原为 @Value("15") 字面量未读配置：改 yaml 只影响对账路径（ReconciliationTask），
+     * 延迟消息主链路仍固定 15 分钟，两条关单路径口径分裂；
+     * 现与 ReconciliationTask 读同一个配置项 seckill.pay-timeout-minutes，改 yaml 一处即同步
      */
-    @Value("15")
+    @Value("${seckill.pay-timeout-minutes:15}")
     private long payTimeoutMinutes;
 
     /* ============================== 下单入口 ============================== */
@@ -147,7 +150,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         lock.lock();
         try {
             // L2 业务查重：已有【有效订单】（active_flag=0）→ 本消息按重复下单终态化。
-            // 已取消的历史单不占位——这是方案A"取消后可重抢"的语义。
+            // 已取消的历史单不占位——取消后可以重新抢购
             // 【阶段4补漏】Lua 已为本消息预扣了 Redis 库存，但本消息注定不会产生订单（幻影扣减），
             // 必须退票：只退库存、不 SREM 资格——用户的资格由其已有有效订单合法持有
             int count = query().eq("user_id", userId).eq("voucher_id", voucherId).eq("active_flag", 0).count();
@@ -170,7 +173,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 // SREM 幂等故无需门闩——此处释放资格是因为资格背后没有库存支撑，用户应可重试
                 log.error("[库存漂移] Redis/DB 库存不一致, orderId={}, voucherId={}", orderId, voucherId);
                 refundRedisStockOnce(orderId, voucherId);
-                stringRedisTemplate.opsForSet().remove(SECKILL_ORDER_KEY + voucherId, userId.toString());
+                stringRedisTemplate.opsForSet().remove(SECKILL_ORDER_KEY + voucherId, userId.toString()); //这一步移除lua脚本中的资格
                 seckillResultStore.mark(orderId, "FAILED:库存不足");
                 return;
             }

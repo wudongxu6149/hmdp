@@ -24,10 +24,13 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
+import java.time.Duration;
 import java.util.stream.Collectors;
 
 import static com.hmdp.utils.RedisConstants.BLOG_LIKED_KEY;
+import static com.hmdp.utils.RedisConstants.BLOG_LIKE_GUARD_KEY;
 import static com.hmdp.utils.RedisConstants.FEED_KEY;
+import static com.hmdp.utils.RedisConstants.FEED_INBOX_MAX;
 
 
 /**
@@ -95,9 +98,13 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
         for (Follow follow : fans) {
             //3.1 获取当前粉丝id
             Long fansId = follow.getUserId();
-            String key = "feed:" + fansId;
+            String key = FEED_KEY + fansId;
             //3.2 推送
             stringRedisTemplate.opsForZSet().add(key, blog.getId().toString(), System.currentTimeMillis());
+            //3.3 【阶段7新增】收件箱封顶：ZREMRANGEBYRANK 从低分端（最旧）删除，
+            //    只保留 rank = -(FEED_INBOX_MAX) 到 -1 的高分端（最新 1000 条），
+            //    防止大 V 粉丝的收件箱随时间无限膨胀拖垮内存
+            stringRedisTemplate.opsForZSet().removeRange(key, 0, -(FEED_INBOX_MAX + 1));
         }
 
         return Result.ok(blog.getId());
@@ -198,20 +205,34 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
 
         //2.判断用户是否已经点过赞
         String key = BLOG_LIKED_KEY + id;
-        Double score = stringRedisTemplate.opsForZSet().score(key, userId.toString());//判断是否在redis的set集合中
+        String member = userId.toString();
+        Double score = stringRedisTemplate.opsForZSet().score(key, member);//判断是否在redis的set集合中
 
-        if (score == null) {
-            //2.1如果没点赞，则更新数据库+1
-            boolean success = update().setSql("liked=liked+1").eq("id", id).update();
-            if (success) {
-                stringRedisTemplate.opsForZSet().add(key, userId.toString(), System.currentTimeMillis());
+        //【阶段7修复】并发互斥门闩：双击/连点时两个请求都会判成同一状态并各自执行一次
+        // liked±1（计数被多加/多减）。SETNX 保证同一用户对同一笔记的并发写只有一个放行，
+        // TTL 5 秒兜底防异常残留导致永久无法操作
+        String guard = BLOG_LIKE_GUARD_KEY + id + ":" + member;
+        Boolean first = stringRedisTemplate.opsForValue().setIfAbsent(guard, "1", Duration.ofSeconds(5));
+        if (!Boolean.TRUE.equals(first)) {
+            return Result.fail("操作太快啦，休息一下");
+        }
+        try {
+            if (score == null) {
+                //2.1如果没点赞，则更新数据库+1
+                boolean success = update().setSql("liked=liked+1").eq("id", id).update();
+                if (success) {
+                    stringRedisTemplate.opsForZSet().add(key, member, System.currentTimeMillis());
+                }
+            } else {
+                //2.2如果点赞了，则数据库-1
+                boolean success1 = update().setSql("liked=liked-1").eq("id", id).update();
+                if (success1) {
+                    stringRedisTemplate.opsForZSet().remove(key, member);
+                }
             }
-        } else {
-            //2.2如果点赞了，则数据库-1
-            boolean success1 = update().setSql("liked=liked-1").eq("id", id).update();
-            if (success1) {
-                stringRedisTemplate.opsForZSet().remove(key, userId.toString());
-            }
+        } finally {
+            // 无论成功失败都释放门闩（下次操作重新竞争）
+            stringRedisTemplate.delete(guard);
         }
 
         return Result.ok();

@@ -78,9 +78,9 @@ public class FollowServiceImpl extends ServiceImpl<FollowMapper, Follow> impleme
         if (user == null) {
             return Result.fail("当前尚未登录!");
         }
-        //如果count>0，说明查询到了有关的数据，返回true
+
         List<Follow> list = query().eq("user_id", user.getId()).eq("follow_user_id", followUserId).list();
-        return Result.ok(list != null || !list.isEmpty());
+        return Result.ok(!list.isEmpty());
     }
 
 

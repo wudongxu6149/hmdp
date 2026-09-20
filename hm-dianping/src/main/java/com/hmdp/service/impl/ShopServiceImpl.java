@@ -11,6 +11,7 @@ import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.hmdp.utils.CacheClient;
+import com.hmdp.utils.MultiLevelCacheClient;
 import com.hmdp.utils.RedisData;
 import com.hmdp.utils.SystemConstants;
 import lombok.extern.slf4j.Slf4j;
@@ -37,10 +38,14 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     private final StringRedisTemplate stringRedisTemplate;
     private final CacheClient cacheClient;
+    /* 【阶段5新增】多级缓存客户端：L1 Caffeine 在前，L2 逻辑过期链路在后 */
+    private final MultiLevelCacheClient multiLevelCacheClient;
 
-    public ShopServiceImpl(StringRedisTemplate stringRedisTemplate, CacheClient cacheClient) {
+    public ShopServiceImpl(StringRedisTemplate stringRedisTemplate, CacheClient cacheClient,
+                           MultiLevelCacheClient multiLevelCacheClient) {
         this.stringRedisTemplate = stringRedisTemplate;
         this.cacheClient = cacheClient;
+        this.multiLevelCacheClient = multiLevelCacheClient;
     }
 
     private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
@@ -59,7 +64,10 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         //使用工具类中的方法
         /*Shop shop=cacheClient.queryWithPassThrough(CACHE_SHOP_KEY,id,Shop.class,
                                                 this::getById,CACHE_SHOP_TTL,TimeUnit.MINUTES);*/
-        Shop shop = cacheClient.queryWithLogicalExpire(CACHE_SHOP_KEY,
+        // 【阶段5重构】多级缓存：L1 Caffeine 命中直接返回（不打 Redis）；
+        // 未命中走 L2 逻辑过期链路（互斥重建语义不变）并回填 L1
+        Shop shop = multiLevelCacheClient.queryWithLogicalExpire(
+                CACHE_SHOP_KEY,
                 id,
                 Shop.class,
                 this::getById,
@@ -215,8 +223,17 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         if (!success) {
             return Result.fail("更新店铺信息失败");
         }
-        //2.先删除缓存，然后从数据库中读取数据
-        stringRedisTemplate.delete(CACHE_SHOP_KEY + id);
+
+        //2.缓存一致性组合拳【阶段5修复：删除改覆盖写】：
+        // 逻辑过期读路径(queryWithLogicalExpire)在 L2 miss 时【不查 DB】，若此处用 delete 删 L2，
+        // 会造成"更新后到下次预热前该商铺查询一律 miss"的真空窗口。
+        // 正统逻辑过期姿势是【覆盖写】：读回 DB 最新全量 → 以逻辑过期包装写入 L2（数据即时最新，
+        // 逻辑过期时间顺延），查询链路零真空；随后广播删各实例 L1（L1 无逻辑过期概念，删除+懒加载回填即可）
+        Shop latest = getById(id);
+        if (latest != null) {
+            cacheClient.setWithExpireTime(CACHE_SHOP_KEY + id, latest, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        }
+        multiLevelCacheClient.invalidateAndBroadcast(CACHE_SHOP_KEY + id);
         log.info("更新店铺信息成功!");
 
         return Result.ok();
