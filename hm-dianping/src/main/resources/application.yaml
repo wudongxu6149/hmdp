@@ -44,6 +44,17 @@ logging:
     com.hmdp: debug
 
 
+# 店铺布隆过滤器：保护“缓存完全缺失后的数据库回源”，解决随机非法 ID 造成的缓存穿透。
+# 预计容量应高于业务生命周期内的店铺总数；误判率 1% 表示少量不存在 ID 仍可能回源，
+# 这部分假阳性会由空值缓存继续吸收。布隆过滤器不会把已正确加入的 ID 判断为不存在。
+cache:
+  bloom:
+    shop:
+      key: bloom:shop:id
+      expected-insertions: 100000 #最大期望插入数量
+      false-probability: 0.01 #允许的误差范围为百分之1
+
+
 # RocketMQ（Windows 本机 NameServer，部署步骤见 docs/ROCKETMQ-DEPLOY.md）
 # 注意：引入 starter 后应用启动即连接 NameServer，必须先启动 RocketMQ 再启动应用
 rocketmq:
@@ -57,6 +68,6 @@ rocketmq:
 # pay-timeout-minutes 同时被两条关单路径读取：延迟消息主链路（handleOrderTimeout/tryCloseOrder）
 # 与对账扫表兜底（ReconciliationTask.closeTimeoutOrders），改这一处两条路径同步生效
 seckill:
-  pay-timeout-minutes: 15            # 支付超时（关单时长）；测试时可改 1
+  pay-timeout-minutes: 5           # 支付超时（关单时长）；测试时可改 1
   reconcile-initial-delay-ms: 30000  # 对账首轮延迟
   reconcile-interval-ms: 60000       # 对账间隔

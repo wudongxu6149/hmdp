@@ -1,5 +1,6 @@
 package com.hmdp.utils;
 
+import com.hmdp.cache.ShopBloomFilter;
 import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.Shop;
 import com.hmdp.service.ISeckillVoucherService;
@@ -14,6 +15,7 @@ import javax.annotation.Resource;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import static com.hmdp.utils.RedisConstants.CACHE_SHOP_KEY;
 import static com.hmdp.utils.RedisConstants.SECKILL_VOUCHER_KEY;
@@ -27,6 +29,8 @@ public class RedisPreHeatRunner {
     private IShopService shopService;
     @Resource
     private CacheClient cacheClient;
+    @Resource
+    private ShopBloomFilter shopBloomFilter;
     /* 【阶段4新增】秒杀券预热依赖 */
     @Resource
     private ISeckillVoucherService seckillVoucherService;
@@ -40,6 +44,12 @@ public class RedisPreHeatRunner {
     public void preHeatData() {
         //获取全部的店铺信息
         List<Shop> list = shopService.list();
+
+        // 【缓存穿透优化】先把数据库中的完整 ID 集合装入布隆过滤器，再标记过滤器可用。
+        // 初始化期间查询会降级放行，初始化完成后不存在的随机 ID 才会在数据库之前被拦截。
+        shopBloomFilter.initialize(
+                list.stream().map(Shop::getId).collect(Collectors.toList()));
+
         list.forEach(shop -> {
             String key = CACHE_SHOP_KEY + shop.getId();
             // 【缓存雪崩优化】每家店铺独立生成 20~30 分钟逻辑 TTL。

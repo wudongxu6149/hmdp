@@ -45,10 +45,9 @@ public class ShopController {
      */
     @PostMapping
     public Result saveShop(@RequestBody Shop shop) {
-        // 写入数据库
-        shopService.save(shop);
-        // 返回店铺id
-        return Result.ok(shop.getId());
+        // 【布隆一致性】新增必须走业务方法，由同一事务完成 DB 插入和布隆 ID 同步；
+        // 不能继续直接调用 IService.save，否则新店铺可能因过滤器没有该 ID 而被永久误判为不存在。
+        return shopService.createShop(shop);
     }
 
     /**

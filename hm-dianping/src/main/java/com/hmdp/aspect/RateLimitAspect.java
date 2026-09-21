@@ -43,10 +43,16 @@ public class RateLimitAspect {
     private StringRedisTemplate stringRedisTemplate;
 
     @Around("@annotation(rateLimit)")
-    public Object around(ProceedingJoinPoint pjp, RateLimit rateLimit) throws Throwable {
-        String dimension = resolveDimension(rateLimit.limitType());
-        String key = KEY_PREFIX + rateLimit.key() + ":" + rateLimit.limitType() + ":" + dimension;
+    public Object rateLimit(ProceedingJoinPoint pjp, RateLimit rateLimit) throws Throwable {
+
+        RateLimit.LimitType limitType = rateLimit.limitType();
+        String dimension = resolveDimension(limitType);
+        // Key 格式：rate_limit:{业务}:{限流类型}[:{用户ID/IP}]
+        String key = KEY_PREFIX + rateLimit.key() + ":" + limitType + ":" + dimension;
+
+        //当前的时间
         long now = System.currentTimeMillis();
+
         // member 唯一化：ZSet 成员唯一，同一毫秒内的多次请求不能互相覆盖
         String member = now + ":" + UUID.randomUUID().toString(true);
         Long allowed = stringRedisTemplate.execute(
@@ -64,7 +70,9 @@ public class RateLimitAspect {
         return pjp.proceed();
     }
 
-    /** 解析限流维度标识：按用户 / 按 IP / 全局 */
+    /**
+     * 解析用户或 IP 限流的主体标识。GLOBAL 不需要主体标识。
+     */
     private String resolveDimension(RateLimit.LimitType type) {
         switch (type) {
             case USER:
@@ -80,14 +88,19 @@ public class RateLimitAspect {
         }
     }
 
-    /** 取客户端 IP：nginx 转发场景优先 X-Forwarded-For 首段，否则 remoteAddr */
+    /**
+     * 取客户端 IP：nginx 转发场景优先 X-Forwarded-For 首段，否则 remoteAddr
+     */
     private String resolveIp() {
+
         ServletRequestAttributes attrs =
                 (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
         if (attrs == null) {
             return "unknown";
         }
         HttpServletRequest request = attrs.getRequest();
+
+        //有些网络通过多层代理，那么获取到的ip就会有多个，一般都是通过逗号（,）分割开来，并且第一个ip为客户端的真实IP
         String xff = request.getHeader("X-Forwarded-For");
         if (xff != null && !xff.isEmpty()) {
             return xff.split(",")[0].trim();

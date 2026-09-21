@@ -9,6 +9,8 @@ import java.lang.annotation.Target;
 /**
  * 【阶段6新增】滑动窗口限流注解（Redis ZSet + Lua 原子实现），标注在 Controller 方法上，
  * 由 RateLimitAspect 环绕拦截：超限直接抛 BizException 快速失败，不进入业务方法
+ *
+ * 自定义注解
  */
 @Target(ElementType.METHOD)
 @Retention(RetentionPolicy.RUNTIME)
@@ -16,7 +18,7 @@ import java.lang.annotation.Target;
 public @interface RateLimit {
 
     /** 业务前缀：不同接口用不同前缀隔离各自的计数器 */
-    String key();
+    String key() ;
 
     /** 窗口长度（秒），默认 10 秒 */
     long window() default 10;

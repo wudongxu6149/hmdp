@@ -8,6 +8,7 @@ import org.springframework.stereotype.Component;
 
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * 【阶段5新增】多级缓存客户端：L1 Caffeine（本机内存）→ L2 Redis → DB。
@@ -35,25 +36,31 @@ public class MultiLevelCacheClient {
         this.stringRedisTemplate = stringRedisTemplate;
     }
 
+
+
     /**
-     * 带逻辑过期语义的多级查询：L1 → L2（逻辑过期）→ DB，命中后逐级回填
-     *
-     * @param keyPrefix 缓存 key 前缀（L1 与 L2 使用同一套 key，失效广播才能按 key 对齐）
-     * @param dbLoader  DB 加载函数（由调用方传入，如 this::getById）
+     * 【缓存穿透优化】L1 → L2 → Bloom → DB 的多级查询。
+     * L1 命中时不访问 Redis；L1 未命中后由 CacheClient 区分 L2 正常值、空值和真正缺失，
+     * 只有缓存真正缺失且布隆判断“可能存在”时才允许加锁回源数据库。
      */
-    public <R, ID> R queryWithLogicalExpire(String keyPrefix, ID id, Class<R> type,
-                                            Function<ID, R> dbLoader, Long ttl, TimeUnit unit) {
+    public <R, ID> R queryWithBloomAndLogicalExpire(String keyPrefix,
+                                                     ID id,
+                                                     Class<R> type,
+                                                     Predicate<ID> bloomPredicate,
+                                                     Function<ID, R> dbLoader,
+                                                     Long ttl,
+                                                     TimeUnit unit) {
         String key = keyPrefix + id;
-        // L1：本机内存命中直接返回（此时不打 Redis）
         String l1Json = localCache.getIfPresent(key);
         if (l1Json != null) {
             return JSONUtil.toBean(l1Json, type);
         }
 
-        // L2：走原有逻辑过期链路（未过期返回 / 过期异步互斥重建 / 未预热返回 null）
-        R result = cacheClient.queryWithLogicalExpire(keyPrefix, id, type, dbLoader, ttl, unit);
+        //Caffeine中未命中店铺缓存
+        R result = cacheClient.queryWithBloomAndLogicalExpire(
+                keyPrefix, id, type, bloomPredicate, dbLoader, ttl, unit);
         if (result != null) {
-            // 回填 L1：缓存最终解析结果（不含 RedisData 逻辑过期包装——L2 层管过期，L1 只管短 TTL）
+            // DB 恢复或 L2 命中后统一回填 L1，后续热点请求不再访问 Redis。
             localCache.put(key, JSONUtil.toJsonStr(result));
         }
         return result;

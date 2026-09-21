@@ -33,8 +33,10 @@ public class RedisConstants {
     public static final String SECKILL_RESULT_KEY = "seckill:result:";
     /* 【阶段4新增】Redis 库存退票幂等标记：seckill:refund:{orderId}，防同一消息重放导致重复回补 */
     public static final String SECKILL_REFUND_KEY = "seckill:refund:";
+
     /* 【阶段5新增】多级缓存失效广播频道（Pub/Sub）：更新方发布，所有实例订阅并删除各自 L1 */
-    public static final String CACHE_INVALIDATE_TOPIC = "cache:invalidate:";
+    public static final String CACHE_INVALIDATE_TOPIC = "cache:invalidate";
+
     /* 【阶段7新增】点赞并发互斥标记：blog:like:guard:{blogId}:{userId}，防双击连点导致计数重复加减 */
     public static final String BLOG_LIKE_GUARD_KEY = "blog:like:guard:";
     /* 【阶段7新增】Feed 收件箱封顶：每个用户的收件箱只保留最近 N 条（防止无限膨胀） */
