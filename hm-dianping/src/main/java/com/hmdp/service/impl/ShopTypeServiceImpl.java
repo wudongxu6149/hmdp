@@ -40,6 +40,7 @@ public class ShopTypeServiceImpl extends ServiceImpl<ShopTypeMapper, ShopType> i
         if (StrUtil.isNotBlank(l1Json)) {
             return JSONUtil.toList(l1Json, ShopType.class);
         }
+
         // 2. L2 Redis：命中后回填 L1（存原始 JSON，与 L2 同源同形态）
         String shopTypeJson = stringRedisTemplate.opsForValue().get(CACHE_SHOP_TYPE);
         if (StrUtil.isNotBlank(shopTypeJson)) {
@@ -47,6 +48,7 @@ public class ShopTypeServiceImpl extends ServiceImpl<ShopTypeMapper, ShopType> i
             localCache.put(CACHE_SHOP_TYPE, shopTypeJson);
             return shopTypes;
         }
+
         // 3. DB 兜底，写回两级
         List<ShopType> shopTypes = query().orderByAsc("sort").select().list();
         if (shopTypes == null || shopTypes.isEmpty()) {
@@ -55,6 +57,7 @@ public class ShopTypeServiceImpl extends ServiceImpl<ShopTypeMapper, ShopType> i
         shopTypeJson = JSONUtil.toJsonStr(shopTypes);
         stringRedisTemplate.opsForValue().set(CACHE_SHOP_TYPE, shopTypeJson, CACHE_SHOP_TTL, TimeUnit.MINUTES);
         localCache.put(CACHE_SHOP_TYPE, shopTypeJson);
+
         return shopTypes;
     }
 }

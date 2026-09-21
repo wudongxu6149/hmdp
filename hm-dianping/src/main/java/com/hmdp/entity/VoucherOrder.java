@@ -27,7 +27,7 @@ public class VoucherOrder implements Serializable {
     private static final long serialVersionUID = 1L;
 
     /**
-     * 主键
+     * 主键；id由RedisIdWorker生成后再进行插入到数据库中
      */
     @TableId(value = "id", type = IdType.INPUT)
     private Long id;

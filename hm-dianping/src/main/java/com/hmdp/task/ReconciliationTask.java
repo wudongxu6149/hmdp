@@ -41,6 +41,7 @@ public class ReconciliationTask {
 
     /** 对账互斥锁：双实例同一时刻只允许一个执行 */
     private static final String RECONCILE_LOCK_KEY = "lock:task:reconcile";
+
     /** 已结束券的对账回溯窗口：只处理最近 7 天结束的券，避免任务无限膨胀 */
     private static final int ENDED_SCAN_DAYS = 7;
     /** 扫表关单单轮批次上限：防单轮锁持有时间过长 */
@@ -126,8 +127,10 @@ public class ReconciliationTask {
      * @param allowFixLow true=允许把低于 DB 的 Redis 向上修正（仅用于已结束、在途已排空的券）
      */
     private void compareAndFixStock(SeckillVoucher sv, boolean allowFixLow) {
+
         String key = SECKILL_VOUCHER_KEY + sv.getVoucherId();
         Object redisStockObj = stringRedisTemplate.opsForHash().get(key, "stock");
+
         if (redisStockObj == null) {
             // Redis 库存丢失（数据丢失/误删）：以 DB 补写，让秒杀恢复可用
             log.warn("[对账] Redis 库存缺失, 以 DB 补写, voucherId={}, dbStock={}",
@@ -135,21 +138,23 @@ public class ReconciliationTask {
             seckillVoucherService.preHeatRedisMeta(sv);
             return;
         }
-        int redisStock = Integer.parseInt(redisStockObj.toString());
-        int dbStock = sv.getStock() == null ? 0 : sv.getStock();
+
+        int redisStock = Integer.parseInt(redisStockObj.toString()); //redis中的库存
+        int dbStock = sv.getStock() == null ? 0 : sv.getStock();    //mysql中的库存
+
         if (redisStock > dbStock) {
-            // 虚高：重复回补/人工误操作等造成——以账本为准向下修正
+            // 虚高：重复回补/人工误操作等造成——以账本为准向下修正，redis的库存只能<=db中的库存
             log.error("[对账] Redis 库存虚高已修正! voucherId={}, redis={}, db={}",
                     sv.getVoucherId(), redisStock, dbStock);
             stringRedisTemplate.opsForHash().put(key, "stock", String.valueOf(dbStock));
         } else if (redisStock < dbStock) {
             if (allowFixLow) {
-                // 已结束仍有缺口：在途不可能存在，说明发生了未回补的净扣减——向上修正
+                // 全部的消息已结束仍有缺口：在途不可能存在，说明发生了未回补的净扣减——向上修正
                 log.error("[对账] 已结束券 Redis 库存缺口已修正! voucherId={}, redis={}, db={}",
                         sv.getVoucherId(), redisStock, dbStock);
                 stringRedisTemplate.opsForHash().put(key, "stock", String.valueOf(dbStock));
             } else {
-                // 进行中的正常瞬时态（在途消息）或未回补的漏损——无法区分，仅告警观察
+                // 进行中的正常瞬时态（在途消息）或未回补的漏损——无法区分，仅告警观察。这个时候消息队列中可能还有没有落库的消息
                 log.warn("[对账] Redis 库存低于 DB（在途消息或漏损）, voucherId={}, redis={}, db={}",
                         sv.getVoucherId(), redisStock, dbStock);
             }
@@ -165,11 +170,14 @@ public class ReconciliationTask {
      */
     private void closeTimeoutOrders() {
         LocalDateTime deadline = LocalDateTime.now().minusMinutes(payTimeoutMinutes);
+
+        //找出15分钟之前创建，但是现在还没有支付的订单
         List<VoucherOrder> timeoutOrders = voucherOrderService.query()
                 .eq("status", 1)
                 .lt("create_time", deadline)
                 .last("LIMIT " + CLOSE_BATCH_LIMIT)
                 .list();
+
         if (timeoutOrders.isEmpty()) {
             return;
         }
@@ -191,30 +199,35 @@ public class ReconciliationTask {
      */
     private void checkQualification() {
         LocalDateTime now = LocalDateTime.now();
+
+        //上个星期已经结束的订单
         List<SeckillVoucher> ended = seckillVoucherService.query()
                 .gt("end_time", now.minusDays(ENDED_SCAN_DAYS))
                 .le("end_time", now).list();
+
         for (SeckillVoucher sv : ended) {
             String orderKey = SECKILL_ORDER_KEY + sv.getVoucherId();
-            Set<String> members = stringRedisTemplate.opsForSet().members(orderKey);
+            Set<String> members = stringRedisTemplate.opsForSet().members(orderKey); //获取到redis中这一张优惠券的全部用户
             if (members == null || members.isEmpty()) {
                 continue;
             }
+
             // DB 账本：该券全部有效订单的去重用户集合
             Set<String> validUsers = voucherOrderService.query()
                     .select("DISTINCT user_id")
                     .eq("voucher_id", sv.getVoucherId())
-                    .eq("active_flag", 0).list().stream()
-                    .map(o -> String.valueOf(o.getUserId()))
-                    .collect(Collectors.toSet());
+                    .eq("active_flag", 0)
+                    .list().stream().map(o -> String.valueOf(o.getUserId())).collect(Collectors.toSet());
 
             int ghostRemoved = 0;
             for (String member : members) {
+                //移除实际有效订单中没有包含的用户
                 if (!validUsers.contains(member)) {
                     stringRedisTemplate.opsForSet().remove(orderKey, member);
                     ghostRemoved++;
                 }
             }
+            //数据库有，但是set中没有的用户
             long lostCount = validUsers.stream().filter(u -> !members.contains(u)).count();
             if (ghostRemoved > 0 || lostCount > 0) {
                 log.warn("[对账] 资格差集核对完成: voucherId={}, 幽灵资格清理 {}, 账本缺资格 {}(仅报告)",

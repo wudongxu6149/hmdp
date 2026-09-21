@@ -53,7 +53,6 @@ public class MultiLevelCacheClient {
         // L2：走原有逻辑过期链路（未过期返回 / 过期异步互斥重建 / 未预热返回 null）
         R result = cacheClient.queryWithLogicalExpire(keyPrefix, id, type, dbLoader, ttl, unit);
         if (result != null) {
-
             // 回填 L1：缓存最终解析结果（不含 RedisData 逻辑过期包装——L2 层管过期，L1 只管短 TTL）
             localCache.put(key, JSONUtil.toJsonStr(result));
         }
@@ -66,6 +65,7 @@ public class MultiLevelCacheClient {
      * 注意：L2 Redis 缓存的删除由调用方在【更新 DB 之后】先行完成——先更库、再逐级失效
      */
     public void invalidateAndBroadcast(String key) {
+        //失效自己的L1缓存
         localCache.invalidate(key);
 
         //向所有订阅了这个频道的实例广播失效

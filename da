@@ -1,0 +1,31 @@
+[33mcommit 59287ee830a34ac84fcbfba6fea8e1dc43059804[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mrocket-dev[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m, [m[1;32mmaster[m[33m)[m
+Author: wudongxu <2271294161@qq.com>
+Date:   Sun Sep 20 20:35:03 2026 +0800
+
+    2026.9.20
+
+[33mcommit 0c0aa63f853958f5af231b1aa2fe82a51415422f[m[33m ([m[1;31morigin/rocket-dev[m[33m)[m
+Author: wudongxu <2271294161@qq.com>
+Date:   Sat Sep 19 19:05:08 2026 +0800
+
+    定时任务扫描”
+    ;
+    git commit -m 定时任务扫描”
+
+[33mcommit f5593b56a5045b7485b6554d36721b3af473a7d9[m
+Author: wudongxu <2271294161@qq.com>
+Date:   Sat Sep 19 14:58:58 2026 +0800
+
+    阶段2-3 rocket改造+CAS补偿
+
+[33mcommit f1ba620bd0d1e522aabc4985465471d58d11addb[m
+Author: wudongxu <2271294161@qq.com>
+Date:   Fri Sep 18 16:03:41 2026 +0800
+
+    阶段0：JDK17 + RocketMQ/Caffeine 依赖 + 一人一单唯一索引脚本 + RocketMQ部署文档
+
+[33mcommit efa55159cad8858778cec1378de8e091fdc28f53[m
+Author: wudongxu <2271294161@qq.com>
+Date:   Fri Sep 18 15:01:05 2026 +0800
+
+    视频版本

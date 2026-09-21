@@ -6,6 +6,7 @@ import com.hmdp.listener.CacheInvalidateListener;
 import com.hmdp.utils.RedisConstants;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.MessageListener;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.listener.ChannelTopic;
 import org.springframework.data.redis.listener.RedisMessageListenerContainer;
@@ -26,14 +27,6 @@ import java.time.Duration;
 @Configuration
 public class CacheConfig {
 
-    private final RedisConnectionFactory connectionFactory;
-    private final CacheInvalidateListener listener;
-
-    public CacheConfig(RedisConnectionFactory connectionFactory,CacheInvalidateListener listener){
-        this.connectionFactory=connectionFactory;
-        this.listener =listener;
-    }
-
     /**
      * L1 本地缓存：值统一存 JSON 字符串（与 L2 的存储形态一致，反序列化口径统一）。
      * maximumSize 防内存膨胀（超容量按访问频率淘汰）；expireAfterWrite 60s 是
@@ -52,7 +45,8 @@ public class CacheConfig {
      * 收到消息后由 CacheInvalidateListener 删除本实例对应的 L1 条目
      */
     @Bean
-    public RedisMessageListenerContainer cacheInvalidateContainer() {
+    public RedisMessageListenerContainer cacheInvalidateContainer(
+            RedisConnectionFactory connectionFactory, CacheInvalidateListener listener) {
 
         RedisMessageListenerContainer container = new RedisMessageListenerContainer();
 

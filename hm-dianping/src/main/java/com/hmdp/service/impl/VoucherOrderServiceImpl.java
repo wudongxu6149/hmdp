@@ -191,6 +191,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 if (getById(orderId) != null) {
                     seckillResultStore.mark(orderId, "SUCCESS");
                 } else {
+                    //唯一索引查询到了另外的订单
                     seckillResultStore.mark(orderId, "FAILED:请勿重复下单");
                 }
                 throw e;
@@ -299,16 +300,19 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         Long orderId = msg.getOrderId();
         VoucherOrder order = getById(orderId);
         if (order == null) {
-            // 订单不存在：落库事务曾回滚（死信已补偿）或消息重放——无需关单，直接 ACK
+            // 订单不存在：说明订单从未成功落库（落库事务回滚，或落库失败已由 DLQ 补偿）。
+            // 该分支是幂等的；若此消息被重放，只会再次命中这里，直接 ACK 即可。
             log.warn("[关单] 订单不存在，忽略, orderId={}", orderId);
             return;
         }
+
         LocalDateTime due = order.getCreateTime().plusMinutes(payTimeoutMinutes);
         LocalDateTime now = LocalDateTime.now();
+
         if (now.isBefore(due)) {
             // 未到期：按剩余时长重投。delayLevel 取 ≥ 剩余时间的最小等级（保证下次到达必已到期），
             // 同时保留 TIMER_DELIVER_MS（被支持时精确到达）
-            long remainMs = Duration.between(now, due).toMillis();
+            long remainMs = Duration.between(now, due).toMillis();  //计算离订单截至还差多少时间
             sendTimeoutMessage(msg, due, delayLevelForRemaining(remainMs));
             log.info("[关单] 未到期，重投剩余 {}ms, orderId={}", remainMs, orderId);
             return;
@@ -348,8 +352,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 .eq("voucher_id", order.getVoucherId())
                 .update();
         // 回补 Redis 库存
-        stringRedisTemplate.opsForHash().increment(SECKILL_VOUCHER_KEY + order.getVoucherId(), "stock", 1);
-        // 解除一人一单资格（用户可重新抢购）
+        stringRedisTemplate.opsForHash().increment(SECKILL_VOUCHER_KEY + order.getVoucherId(), "stock",1);
+        // 解除一人一单资格（用户可重新抢购,移除set中的用户记录）
         stringRedisTemplate.opsForSet().remove(SECKILL_ORDER_KEY + order.getVoucherId(), order.getUserId().toString());
         // 轮询侧同步终态
         seckillResultStore.mark(orderId, "CLOSED:超时未支付");
@@ -364,10 +368,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * 无论 Broker 支持哪种，到达即视为到期
      */
     private void sendTimeoutMessage(SeckillMessage payload, LocalDateTime due, Integer delayLevel) {
+
         Message<SeckillMessage> message = MessageBuilder.withPayload(payload)
-                .setHeader("TIMER_DELIVER_MS", String.valueOf(toEpochMilli(due)))
+                .setHeader("TIMER_DELIVER_MS", String.valueOf(toEpochMilli(due))) //真正的订单截止时间
                 .setHeader("KEYS", String.valueOf(payload.getOrderId())) // 消息Key，便于控制台按订单号追踪
                 .build();
+
         if (delayLevel == null) {
             rocketMQTemplate.syncSend(MQConstants.TOPIC_ORDER_TIMEOUT, message);
         } else {
