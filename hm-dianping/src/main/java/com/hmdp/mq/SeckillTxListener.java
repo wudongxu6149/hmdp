@@ -72,6 +72,9 @@ public class SeckillTxListener implements RocketMQLocalTransactionListener {
     /**
      * Broker 回查（生产者发送 COMMIT 前宕机等场景）：以 Redis 事务标记为唯一事实。
      * 标记由 seckill.lua 与扣减原子写入，TTL 1 天远大于回查窗口（分钟级），不存在歧义。
+     *
+     * SECKILL_TX_KEY 是 Redis 秒杀资格事务的成功凭证。Broker 回查发现标记存在，
+     * 就 COMMIT 原来的 seckill_order 事务半消息；订单消费者收到该消息并成功落库后，再由应用发送 order_timeout 时间轮消息。
      */
     @Override
     public RocketMQLocalTransactionState checkLocalTransaction(Message msg) {

@@ -55,13 +55,17 @@ mqbroker.cmd -n 127.0.0.1:9876 -c conf\broker.conf
 
 ```cmd
 mqadmin updateTopic -n 127.0.0.1:9876 -c DefaultCluster -t seckill_order -r 8 -w 8
-mqadmin updateTopic -n 127.0.0.1:9876 -c DefaultCluster -t order_timeout -r 4 -w 4
+mqadmin updateTopic -n 127.0.0.1:9876 -c DefaultCluster -t order_timeout -r 4 -w 4 -a +message.type=DELAY
 ```
 
 | Topic | 用途 | 队列数 |
 |---|---|---|
 | `seckill_order` | 秒杀订单落库：事务消息 COMMIT 后在此被消费（消费者组只有一个 → 死信链路只有一条）；8 队列为扩容预留 | 8 |
 | `order_timeout` | 订单超时关单（15 分钟精确延迟，**阶段3已启用，必建**） | 4 |
+
+> `order_timeout` 必须声明为 `DELAY` 类型：RocketMQ 5.x 会按 Topic 消息类型校验高级消息，
+> 仅设置 `timerWheelEnable=true` 只代表 Broker 启用了时间轮存储，并不能把普通 Topic 自动变成延迟 Topic。
+> Java 侧同时必须调用 `syncSendDeliverTimeMills`，由客户端写入时间轮识别所需的系统属性。
 
 > 说明：早期方案中的 `seckill_order_tx` 已取消（事务消息与普通消息共用 `seckill_order`）；
 > 原"策略B"已从代码中移除（见 git 历史），本表即最终形态。

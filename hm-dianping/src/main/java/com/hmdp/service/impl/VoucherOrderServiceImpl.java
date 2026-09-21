@@ -200,10 +200,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             // 终态 SUCCESS：标记写在落库之后、事务提交之前——客户端看到 SUCCESS 时订单必然已可查
             seckillResultStore.mark(orderId, "SUCCESS");
 
-            // 【阶段3新增】发送延迟关单消息：精确投递时间 = 下单时间 + 支付超时（5.x 时间轮 TIMER_DELIVER_MS）。
-            // 若属性不被 Broker 支持（消息立即到达），消费者会按剩余时长重投兜底；
-            // 订单超时未支付将被 CAS 关单并回补库存/资格；若落库事务最终回滚，消费者按"订单不存在"丢弃，无害
-            sendTimeoutMessage(msg, LocalDateTime.now().plusMinutes(payTimeoutMinutes), null);
+            // 【时间轮修复】这里传入的是“绝对投递时间”，sendTimeoutMessage 会通过
+            // RocketMQTemplate.syncSendDeliverTimeMills 调用原生 Message#setDeliverTimeMs。
+            // 旧实现把 TIMER_DELIVER_MS 塞进 Spring Header 后调用普通 syncSend，但该名称属于
+            // RocketMQ 保留系统属性，会在 Spring Message 转原生消息时被过滤，导致消息立即投递。
+            // 改为专用 API 后 Broker 才能识别时间轮属性，订单超时前不会进入消费队列。
+            sendTimeoutMessage(msg, LocalDateTime.now().plusMinutes(payTimeoutMinutes));
         } finally {
             lock.unlock();
         }
@@ -291,8 +293,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     /**
      * 关单延迟消息消费入口。
-     * 消息可能早到（TIMER_DELIVER_MS 未生效、消息重放等）：未到期按剩余时长重投，到期才关单——
-     * 这是"精确15分钟"在 4.x 客户端 + 5.x Broker 组合下的可靠实现路径
+     * 正常情况下消息由 RocketMQ 5.x 时间轮在 due 时刻投递；如果因时钟偏差、历史消息重放等原因早到，
+     * 仍使用同一个绝对时间重新写入时间轮。这样既保留消费端的防御性校验，也不会退化为经典延迟等级。
      */
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -310,10 +312,11 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         LocalDateTime now = LocalDateTime.now();
 
         if (now.isBefore(due)) {
-            // 未到期：按剩余时长重投。delayLevel 取 ≥ 剩余时间的最小等级（保证下次到达必已到期），
-            // 同时保留 TIMER_DELIVER_MS（被支持时精确到达）
-            long remainMs = Duration.between(now, due).toMillis();  //计算离订单截至还差多少时间
-            sendTimeoutMessage(msg, due, delayLevelForRemaining(remainMs));
+            // 【时间轮修复】早到消息仍按原始 due 绝对时间重新投递。
+            // 旧代码会把剩余时间映射到 1~18 级经典延迟等级，不仅丢失毫秒级精度，
+            // 还会让系统表面上一直走经典延迟；现在统一进入 5.x 时间轮，行为和首次发送完全一致。
+            long remainMs = Duration.between(now, due).toMillis();
+            sendTimeoutMessage(msg, due);
             log.info("[关单] 未到期，重投剩余 {}ms, orderId={}", remainMs, orderId);
             return;
         }
@@ -334,6 +337,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         VoucherOrder order = getById(orderId);
         if (order == null || order.getStatus() != 1) {
             // 已支付/已关闭/不存在：CAS 败者，幂等返回
+            log.info("[关单] 订单为空或订单已关闭/支付, orderId={}, voucherId={}", orderId, order.getVoucherId());
             return false;
         }
         boolean closed = update()
@@ -344,6 +348,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 .update();
         if (!closed) {
             // 并发竞争败者（恰好此刻支付成功 / 已被其他线程关闭）
+            log.info("[关单] 订单不满足唯一索引, orderId={}, voucherId={}", orderId, order.getVoucherId());
             return false;
         }
         // 回补 DB 库存
@@ -362,45 +367,26 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     }
 
     /**
-     * 【阶段3新增】发送关单延迟消息。
-     * 优先设置 TIMER_DELIVER_MS（5.x 时间轮，毫秒级精确投递，broker 需 timerWheelEnable=true）；
-     * delayLevel 参数非空时（重投场景）同时设置经典延迟等级兜底——两者都指向"不早于到期时刻"，
-     * 无论 Broker 支持哪种，到达即视为到期
+     * 【时间轮修复】发送 RocketMQ 5.x 任意精度延迟消息。
+     *
+     * TIMER_DELIVER_MS 是 RocketMQ 的保留系统属性，不能通过 Spring Message#setHeader 当成普通属性传递；
+     * rocketmq-spring 2.2.3 会过滤该 Header。必须调用 syncSendDeliverTimeMills，由模板在原生消息上执行
+     * Message#setDeliverTimeMs，Broker 才会把消息写入时间轮。此处只保留业务 KEYS Header 用于消息追踪。
+     *
+     * @param payload 关单消息体
+     * @param due     订单应触发超时检查的绝对时间
      */
-    private void sendTimeoutMessage(SeckillMessage payload, LocalDateTime due, Integer delayLevel) {
+    private void sendTimeoutMessage(SeckillMessage payload, LocalDateTime due) {
 
         Message<SeckillMessage> message = MessageBuilder.withPayload(payload)
-                .setHeader("TIMER_DELIVER_MS", String.valueOf(toEpochMilli(due))) //真正的订单截止时间
-                .setHeader("KEYS", String.valueOf(payload.getOrderId())) // 消息Key，便于控制台按订单号追踪
+                // KEYS 是模板明确支持映射到原生消息的索引字段，保留后可在控制台按订单号追踪。
+                .setHeader("KEYS", String.valueOf(payload.getOrderId()))
                 .build();
 
-        if (delayLevel == null) {
-            rocketMQTemplate.syncSend(MQConstants.TOPIC_ORDER_TIMEOUT, message);
-        } else {
-            rocketMQTemplate.syncSend(MQConstants.TOPIC_ORDER_TIMEOUT, message, 3000, delayLevel);
-        }
-    }
+        // 专用 API 会把 due 转成原生 TIMER_DELIVER_MS 系统属性；普通 syncSend + 自定义 Header 无法做到这一点。
+        rocketMQTemplate.syncSendDeliverTimeMills(
+                MQConstants.TOPIC_ORDER_TIMEOUT, message, toEpochMilli(due));
 
-    /**
-     * 【阶段3新增】RocketMQ 经典延迟等级表（1~18 级，毫秒）：
-     * 1s 5s 10s 30s 1m 2m 3m 4m 5m 6m 7m 8m 9m 10m 20m 30m 1h 2h
-     */
-    private static final long[] DELAY_LEVEL_MS = {
-            1_000L, 5_000L, 10_000L, 30_000L,
-            60_000L, 120_000L, 180_000L, 240_000L, 300_000L,
-            360_000L, 420_000L, 480_000L, 540_000L, 600_000L,
-            1_200_000L, 1_800_000L, 3_600_000L, 7_200_000L};
-
-    /**
-     * 【阶段3新增】为剩余时长选取 ≥ 它的最小延迟等级（保证重投后到达时订单必已到期）；超出2h兜底取18级
-     */
-    private int delayLevelForRemaining(long remainMs) {
-        for (int i = 0; i < DELAY_LEVEL_MS.length; i++) {
-            if (DELAY_LEVEL_MS[i] >= remainMs) {
-                return i + 1;
-            }
-        }
-        return DELAY_LEVEL_MS.length;
     }
 
     /**

@@ -63,15 +63,17 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
         //使用工具类中的方法
         /*Shop shop=cacheClient.queryWithPassThrough(CACHE_SHOP_KEY,id,Shop.class,
-                                                this::getById,CACHE_SHOP_TTL,TimeUnit.MINUTES);*/
+                                      this::getById,randomCacheTtlMinutes(),TimeUnit.MINUTES);*/
         // 【阶段5重构】多级缓存：L1 Caffeine 命中直接返回（不打 Redis）；
         // 未命中走 L2 逻辑过期链路（互斥重建语义不变）并回填 L1
+        // 【缓存雪崩优化】每次发生真实缓存写入时使用 20~30 分钟随机逻辑 TTL，
+        // 避免启动预热的一批店铺在同一时刻逻辑过期并集中提交数据库重建任务。
         Shop shop = multiLevelCacheClient.queryWithLogicalExpire(
                 CACHE_SHOP_KEY,
                 id,
                 Shop.class,
                 this::getById,
-                CACHE_SHOP_TTL, TimeUnit.MINUTES);
+                randomCacheTtlMinutes(), TimeUnit.MINUTES);
 
         if (shop == null) { //说明查到了空值
             return Result.fail("店铺信息不存在!");
@@ -112,7 +114,10 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
                         log.info("缓存已被其他线程刷新，id: {}", id);
                         return;  // 已被刷新，直接返回
                     }
-                    cacheClient.setWithExpireTime(cacheKey, shop, CACHE_SHOP_TTL, TimeUnit.SECONDS);
+                    // 【缓存雪崩优化】备用逻辑过期实现同样使用分钟级随机 TTL；旧代码不仅固定为 30，
+                    // 还误用了 SECONDS，可能让缓存约 30 秒就过期，现在统一为 20~30 分钟。
+                    cacheClient.setWithExpireTime(
+                            cacheKey, shop, randomCacheTtlMinutes(), TimeUnit.MINUTES);
                 } catch (Exception e) {
                     throw new RuntimeException(e);
                 } finally {
@@ -163,7 +168,9 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
                         return null;
                     }
                     // 数据库存在，写入缓存
-                    stringRedisTemplate.opsForValue().set(cacheKey, JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
+                    // 【缓存雪崩优化】物理 TTL 也按 Key 独立随机，避免备用互斥锁方案启用时批量失效。
+                    stringRedisTemplate.opsForValue().set(
+                            cacheKey, JSONUtil.toJsonStr(shop), randomCacheTtlMinutes(), TimeUnit.MINUTES);
                     return shop;
                 } finally {
                     // 释放锁
@@ -205,8 +212,11 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             return null;
         }
         //把查询到的结果添加到redis中，并返回
-        stringRedisTemplate.opsForValue().set(CACHE_SHOP_KEY + id, JSONUtil.toJsonStr(shop)
-                , CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        // 【缓存雪崩优化】穿透查询回填正常数据时设置 20~30 分钟随机物理 TTL，
+        // 空值仍保持独立的短 TTL，避免不存在的数据长期占用缓存。
+        stringRedisTemplate.opsForValue().set(
+                CACHE_SHOP_KEY + id, JSONUtil.toJsonStr(shop),
+                randomCacheTtlMinutes(), TimeUnit.MINUTES);
         return shop;
     }
 
@@ -231,7 +241,10 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         // 逻辑过期时间顺延），查询链路零真空；随后广播删各实例 L1（L1 无逻辑过期概念，删除+懒加载回填即可）
         Shop latest = getById(id);
         if (latest != null) {
-            cacheClient.setWithExpireTime(CACHE_SHOP_KEY + id, latest, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+            // 【缓存雪崩优化】更新店铺后的覆盖写也重新生成随机逻辑 TTL，
+            // 防止批量更新操作把大量 Key 的下一次逻辑过期时间重新对齐。
+            cacheClient.setWithExpireTime(
+                    CACHE_SHOP_KEY + id, latest, randomCacheTtlMinutes(), TimeUnit.MINUTES);
         }
         multiLevelCacheClient.invalidateAndBroadcast(CACHE_SHOP_KEY + id);
         log.info("更新店铺信息成功!");

@@ -16,8 +16,8 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static com.hmdp.utils.RedisConstants.CACHE_SHOP_KEY;
-import static com.hmdp.utils.RedisConstants.CACHE_SHOP_TTL;
 import static com.hmdp.utils.RedisConstants.SECKILL_VOUCHER_KEY;
+import static com.hmdp.utils.RedisConstants.randomCacheTtlMinutes;
 
 @Component
 @Slf4j
@@ -42,7 +42,10 @@ public class RedisPreHeatRunner {
         List<Shop> list = shopService.list();
         list.forEach(shop -> {
             String key = CACHE_SHOP_KEY + shop.getId();
-            cacheClient.setWithExpireTime(key, shop, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+            // 【缓存雪崩优化】每家店铺独立生成 20~30 分钟逻辑 TTL。
+            // 预热通常在短时间内批量写入；随机化可以避免所有店铺在固定 30 分钟后同时进入重建流程。
+            cacheClient.setWithExpireTime(
+                    key, shop, randomCacheTtlMinutes(), TimeUnit.MINUTES);
         });
         log.info("已完成店铺预热");
     }

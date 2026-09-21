@@ -14,8 +14,8 @@ import org.springframework.stereotype.Service;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
-import static com.hmdp.utils.RedisConstants.CACHE_SHOP_TTL;
 import static com.hmdp.utils.RedisConstants.CACHE_SHOP_TYPE;
+import static com.hmdp.utils.RedisConstants.randomCacheTtlMinutes;
 
 /**
  * <p>
@@ -55,7 +55,10 @@ public class ShopTypeServiceImpl extends ServiceImpl<ShopTypeMapper, ShopType> i
             return null;
         }
         shopTypeJson = JSONUtil.toJsonStr(shopTypes);
-        stringRedisTemplate.opsForValue().set(CACHE_SHOP_TYPE, shopTypeJson, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        // 【缓存雪崩优化】类型列表虽然只有一个 Key，也统一采用 20~30 分钟随机物理 TTL，
+        // 避免它与店铺缓存或未来新增的字典缓存固定在同一分钟集中失效。
+        stringRedisTemplate.opsForValue().set(
+                CACHE_SHOP_TYPE, shopTypeJson, randomCacheTtlMinutes(), TimeUnit.MINUTES);
         localCache.put(CACHE_SHOP_TYPE, shopTypeJson);
 
         return shopTypes;
