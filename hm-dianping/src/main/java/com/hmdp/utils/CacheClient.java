@@ -1,13 +1,16 @@
 package com.hmdp.utils;
 
-import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -22,10 +25,22 @@ public class CacheClient {
 
     private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(30);
 
-    private final StringRedisTemplate stringRedisTemplate;
+    /**
+     * 逻辑过期的异步重建任务去重表，只在当前 JVM 内生效。
+     * <p>
+     * 同一个实例的高并发请求同时发现某个 Key 过期时，只有第一个请求能通过 add(lockKey)
+     * 提交线程池任务，其他请求直接返回旧值，避免大量无效任务堆积在线程池中。
+     * 两个应用实例各自维护一份该集合，因此它不能代替分布式锁；真正保证跨实例只有一个
+     * 数据库重建者的是后续的 Redisson RLock。
+     */
+    private static final Set<String> REBUILDING_KEYS = ConcurrentHashMap.newKeySet();
 
-    public CacheClient(StringRedisTemplate stringRedisTemplate) {
+    private final StringRedisTemplate stringRedisTemplate;
+    private final RedissonClient redissonClient;
+
+    public CacheClient(StringRedisTemplate stringRedisTemplate, RedissonClient redissonClient) {
         this.stringRedisTemplate = stringRedisTemplate;
+        this.redissonClient = redissonClient;
     }
 
     //方法1：将任意java对象序列化为json对象并存储再string类型的key中，并且可以设置ttl过期时间
@@ -156,14 +171,16 @@ public class CacheClient {
         if (time.isAfter(LocalDateTime.now())) {
             return r;
         }
-        //过期：获取互斥锁
-        boolean flag = tryLock(lockKey);
-        //判断锁是否获取成功
-        //获取锁成功：开启独立线程，读取数据库信息并写入redis
-        if (flag) {
-            CACHE_REBUILD_EXECUTOR.submit(() ->
-            {
+        // 此路径有旧值可返回，因此可以异步重建：本地集合只合并线程池任务，Redisson 负责跨实例互斥。
+        if (REBUILDING_KEYS.add(lockKey)) {
+            CACHE_REBUILD_EXECUTOR.submit(() -> {
+                RLock lock = redissonClient.getLock(lockKey);
                 try {
+                    // Redisson 锁必须由加锁线程解锁，因此在异步任务内完成整个重建流程。
+                    if (!lock.tryLock()) {
+                        return;
+                    }
+
                     //二次检查，防止重复查数据库
                     String json2 = stringRedisTemplate.opsForValue().get(cacheKey);
                     if (StrUtil.isNotBlank(json2)) {
@@ -182,21 +199,27 @@ public class CacheClient {
                     } else {
                         this.setWithExpireTime(cacheKey, r1, expireTime, unit);
                     }
-
                 } catch (Exception e) {
                     log.error("异步重建逻辑过期缓存失败: key={}", cacheKey, e);
                 } finally {
-                    unlock(lockKey);
+                    if (lock.isHeldByCurrentThread()) {
+                        lock.unlock();
+                    }
+                    REBUILDING_KEYS.remove(lockKey);
                 }
             });
         }
-        //获取锁失败，直接返回旧值
+        // 逻辑过期仍直接返回旧值。
         return r;
     }
 
     /**
-     * Redis 缓存被删除或丢失时的同步恢复路径。互斥锁保证同一店铺只有一个请求访问数据库，
-     * 其余请求短暂等待并轮询重建结果，避免一个真实热点 Key 缺失时形成缓存击穿。
+     * Redis 缓存被删除或丢失时的同步恢复路径。此时没有旧值可返回，请求必须同步等待重建结果；
+     * Redisson 保证同一店铺只有一个请求访问数据库，其余请求短暂等待并轮询 Redis。
+     * <p>
+     * 这里不使用 REBUILDING_KEYS：该集合用于避免重复提交异步线程池任务，而本方法由请求线程
+     * 自己重建或等待，并不存在异步任务队列堆积问题；即使加入本地集合，其他请求仍然必须轮询
+     * Redis，不能直接返回 null，因此无法替代 Redisson 锁。
      */
     private <R, ID> R rebuildMissingCacheWithMutex(String cacheKey,
                                                    String lockKey,
@@ -208,7 +231,8 @@ public class CacheClient {
         for (int retry = 0; retry < 20; retry++) {
 
             //如果抢到锁，则由当前请求同步查询数据库并重建缓存
-            if (tryLock(lockKey)) {
+            RLock lock = redissonClient.getLock(lockKey);
+            if (lock.tryLock()) {
                 try {
                     // Double Check：等待锁期间可能已有线程完成重建，拿锁后必须重新检查 Redis。
                     String latestJson = stringRedisTemplate.opsForValue().get(cacheKey);
@@ -232,7 +256,9 @@ public class CacheClient {
                     return loaded;
 
                 } finally {
-                    unlock(lockKey);
+                    if (lock.isHeldByCurrentThread()) {
+                        lock.unlock();
+                    }
                 }
             }
 
@@ -259,16 +285,5 @@ public class CacheClient {
         // 锁持有时间异常时不允许绕过互斥锁直接打 DB，宁可本次快速失败，保护数据库优先。
         log.warn("等待店铺缓存重建超时: key={}", cacheKey);
         return null;
-    }
-
-    //加锁
-    private boolean tryLock(String key) {
-        Boolean b = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", LOCK_SHOP_TTL, TimeUnit.SECONDS);
-        return BooleanUtil.isTrue(b);
-    }
-
-    //解锁
-    private void unlock(String key) {
-        stringRedisTemplate.delete(key);
     }
 }

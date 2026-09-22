@@ -11,6 +11,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import javax.annotation.Resource;
 import java.util.List;
@@ -57,10 +59,17 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
         seckillVoucher.setEndTime(voucher.getEndTime());
         seckillVoucherService.save(seckillVoucher);
 
-        // 预热秒杀元数据到 Redis Hash：stock 参与原子扣减，beginTime/endTime 供 Lua 校验秒杀时间窗。
-        // 【阶段4重构】Hash 写入下沉到 SeckillVoucherServiceImpl.preHeatRedisMeta（唯一写入点），
-        // 与启动预热（RedisPreHeatRunner）共用，字段定义不会两处漂移
-        seckillVoucherService.preHeatRedisMeta(seckillVoucher);
+        // 数据库提交成功后再预热 Redis，避免事务回滚后留下幽灵秒杀券。
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                try {
+                    seckillVoucherService.preHeatRedisMeta(seckillVoucher);
+                } catch (RuntimeException e) {
+                    log.error("秒杀券提交后预热 Redis 失败, voucherId={}", seckillVoucher.getVoucherId(), e);
+                }
+            }
+        });
     }
 
 

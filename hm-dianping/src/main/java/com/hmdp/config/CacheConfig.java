@@ -46,10 +46,10 @@ public class CacheConfig {
      */
     @Bean
     public RedisMessageListenerContainer cacheInvalidateContainer(
-            RedisConnectionFactory connectionFactory, CacheInvalidateListener listener) {
+            RedisConnectionFactory connectionFactory,
+            CacheInvalidateListener listener) {
 
         RedisMessageListenerContainer container = new RedisMessageListenerContainer();
-
         container.setConnectionFactory(connectionFactory);
         container.addMessageListener(listener, new ChannelTopic(RedisConstants.CACHE_INVALIDATE_TOPIC));
 

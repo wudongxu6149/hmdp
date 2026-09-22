@@ -144,25 +144,40 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         if (id == null) {
             return Result.fail("店铺信息不完整!");
         }
+
         //1.修改数据库中的信息，只更新非null字段
         boolean success = updateById(shop);
         if (!success) {
             return Result.fail("更新店铺信息失败");
         }
 
-        //2.缓存一致性组合拳【阶段5修复：删除改覆盖写】：
+        //2.读取事务内的最新全量数据，提交成功后再更新缓存：
         // 逻辑过期读路径(queryWithLogicalExpire)在 L2 miss 时【不查 DB】，若此处用 delete 删 L2，
         // 会造成"更新后到下次预热前该商铺查询一律 miss"的真空窗口。
         // 正统逻辑过期姿势是【覆盖写】：读回 DB 最新全量 → 以逻辑过期包装写入 L2（数据即时最新，
         // 逻辑过期时间顺延），查询链路零真空；随后广播删各实例 L1（L1 无逻辑过期概念，删除+懒加载回填即可）
         Shop latest = getById(id);
-        if (latest != null) {
-            // 【缓存雪崩优化】更新店铺后的覆盖写也重新生成随机逻辑 TTL，
-            // 防止批量更新操作把大量 Key 的下一次逻辑过期时间重新对齐。
-            cacheClient.setWithExpireTime(
-                    CACHE_SHOP_KEY + id, latest, randomCacheTtlMinutes(), TimeUnit.MINUTES);
-        }
-        multiLevelCacheClient.invalidateAndBroadcast(CACHE_SHOP_KEY + id);
+        String cacheKey = CACHE_SHOP_KEY + id;
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                try {
+                    if (latest != null) {
+                        // 覆盖 L2 并重新生成随机逻辑 TTL，避免批量 Key 同时过期。
+                        cacheClient.setWithExpireTime(
+                                cacheKey, latest, randomCacheTtlMinutes(), TimeUnit.MINUTES);
+                    }
+                } catch (RuntimeException e) {
+                    log.error("店铺提交后刷新 Redis 缓存失败, shopId={}", id, e);
+                }
+
+                try {
+                    multiLevelCacheClient.invalidateAndBroadcast(cacheKey);
+                } catch (RuntimeException e) {
+                    log.error("店铺提交后广播缓存失效失败, shopId={}", id, e);
+                }
+            }
+        });
         log.info("更新店铺信息成功!");
 
         return Result.ok();
