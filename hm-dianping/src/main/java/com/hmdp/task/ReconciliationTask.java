@@ -2,6 +2,8 @@ package com.hmdp.task;
 
 import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.VoucherOrder;
+import com.hmdp.mq.SeckillPendingOrderStore;
+import com.hmdp.service.impl.CloseRefundService;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import lombok.extern.slf4j.Slf4j;
@@ -25,11 +27,13 @@ import static com.hmdp.utils.RedisConstants.SECKILL_VOUCHER_KEY;
  * 【阶段4新增】定时对账任务——数据一致性保障的"最后一环"：
  * 事务消息/延迟消息/回补链路负责主路径尽量不出错，本任务负责【错了之后收敛】。
  *
- * 三个子任务（每轮依次执行，任一失败不影响其余，下一轮重试）：
- *   ① 库存对账：以订单表+DB库存为账本，校正 Redis 库存（含"只修虚高"的进行中保护，见方法注释）
- *   ② 扫表关单：status=1 且超时的订单走 tryCloseOrder（复用阶段3的 CAS 关单+回补），
+ * 五个子任务（每轮依次执行，任一失败不影响其余，下一轮重试）：
+ *   ① 恢复 Lua 已预扣但未落库的订单，兜底半消息被最终放弃的情况
+ *   ② 重试已提交关单的 Redis 回补
+ *   ③ 库存对账：以订单表+DB库存为账本，校正 Redis 库存（含"只修虚高"的进行中保护，见方法注释）
+ *   ④ 扫表关单：status=1 且超时的订单走 tryCloseOrder（复用阶段3的 CAS 关单+回补），
  *      兜底"延迟消息丢失/关单消费者不可用"导致的订单永久冻结库存
- *   ③ 资格核对：已结束秒杀券的资格 Set 与 DB 有效订单差集核对，清理幽灵资格
+ *   ⑤ 资格核对：已结束秒杀券的资格 Set 与 DB 有效订单差集核对，清理幽灵资格
  *
  * 双实例部署下的互斥：Redisson 锁 tryLock 快速失败——同一时刻只有一个实例执行本轮对账，
  * 抢不到锁的实例直接跳过（对账下一轮还会跑，无需等待）。
@@ -44,8 +48,13 @@ public class ReconciliationTask {
 
     /** 已结束券的对账回溯窗口：只处理最近 7 天结束的券，避免任务无限膨胀 */
     private static final int ENDED_SCAN_DAYS = 7;
-    /** 扫表关单单轮批次上限：防单轮锁持有时间过长 */
+    /** 扫表关单的单轮批次上限：防单轮锁持有时间过长 */
     private static final int CLOSE_BATCH_LIMIT = 100;
+    private static final int RECOVERY_BATCH_LIMIT = 100;
+    private static final int CLOSE_REFUND_BATCH_LIMIT = 100;
+
+    //对于Redis已扣库存但是消息投递失败的消息来说，稍后等30秒再重试一遍
+    private static final long RECOVERY_RETRY_DELAY_MS = 300000;
 
     @Resource
     private ISeckillVoucherService seckillVoucherService;
@@ -55,6 +64,10 @@ public class ReconciliationTask {
     private StringRedisTemplate stringRedisTemplate;
     @Resource
     private RedissonClient redissonClient;
+    @Resource
+    private SeckillPendingOrderStore pendingOrderStore;
+    @Resource
+    private CloseRefundService closeRefundService;
 
     /**
      * 【阶段4新增】关单超时分钟数：与关单消费者（OrderTimeoutConsumer 链路）读同一个配置项，
@@ -76,6 +89,16 @@ public class ReconciliationTask {
         }
         try {
             try {
+                recoverPendingOrders();
+            } catch (Exception e) {
+                log.error("[对账] 秒杀订单恢复异常, 下轮重试", e);
+            }
+            try {
+                repairCloseRefunds();
+            } catch (Exception e) {
+                log.error("[对账] 关单 Redis 回补异常, 下轮重试", e);
+            }
+            try {
                 reconcileStock();
             } catch (Exception e) {
                 log.error("[对账] 库存对账异常, 下轮重试", e);
@@ -92,6 +115,41 @@ public class ReconciliationTask {
             }
         } finally {
             lock.unlock();
+        }
+    }
+
+    /** 订单已关闭但 Redis 回补未完成的订单，按原 orderId 幂等试。 */
+    private void repairCloseRefunds() {
+        List<VoucherOrder> pending = voucherOrderService.query()
+                .eq("status", 4)
+                .eq("close_refund_pending", 1)
+                .last("LIMIT " + CLOSE_REFUND_BATCH_LIMIT)
+                .list();
+        for (VoucherOrder order : pending) {
+            try {
+                closeRefundService.apply(order.getId());
+            } catch (Exception e) {
+                log.error("[对账] 关单 Redis 回补失败, orderId={}", order.getId(), e);
+            }
+        }
+    }
+
+    /** 秒杀 Lua 已经扣了 Redis 库存并写下 pending 记录，
+     * 但正常 MQ 流程最终没有把订单落入 MySQL。对账任务便可按原订单号重新走落库流程。
+     * 根据标记恢复订单，知道正真落库或者退款才会移除
+     * */
+    private void recoverPendingOrders() {
+        Set<String> due = pendingOrderStore.due(System.currentTimeMillis(), RECOVERY_BATCH_LIMIT);
+        if (due == null || due.isEmpty()) {
+            return;
+        }
+        for (String member : due) {
+            try {
+                voucherOrderService.landSeckillOrder(pendingOrderStore.parse(member));
+            } catch (Exception e) {
+                log.error("[对账] 秒杀订单恢复失败, record={}", member, e);
+                pendingOrderStore.retryLater(member, System.currentTimeMillis() + RECOVERY_RETRY_DELAY_MS);
+            }
         }
     }
 
@@ -131,7 +189,18 @@ public class ReconciliationTask {
         String key = SECKILL_VOUCHER_KEY + sv.getVoucherId();
         Object redisStockObj = stringRedisTemplate.opsForHash().get(key, "stock");
 
+        // DB 已回补、Redis 尚未回补时不能先用 DB 值覆盖 Redis；否则随后幂等 Lua 仍会 +1。
+        boolean hasPendingCloseRefund = voucherOrderService.query()
+                .eq("voucher_id", sv.getVoucherId())
+                .eq("status", 4)
+                .eq("close_refund_pending", 1)
+                .count() > 0;
+
         if (redisStockObj == null) {
+            if (hasPendingCloseRefund) {
+                log.warn("[对账] Redis 库存缺失但关单回补尚未完成，暂不按 DB 补写, voucherId={}", sv.getVoucherId());
+                return;
+            }
             // Redis 库存丢失（数据丢失/误删）：以 DB 补写，让秒杀恢复可用
             log.warn("[对账] Redis 库存缺失, 以 DB 补写, voucherId={}, dbStock={}",
                     sv.getVoucherId(), sv.getStock());
@@ -148,7 +217,7 @@ public class ReconciliationTask {
                     sv.getVoucherId(), redisStock, dbStock);
             stringRedisTemplate.opsForHash().put(key, "stock", String.valueOf(dbStock));
         } else if (redisStock < dbStock) {
-            if (allowFixLow) {
+            if (allowFixLow && !hasPendingCloseRefund) {
                 // 全部的消息已结束仍有缺口：在途不可能存在，说明发生了未回补的净扣减——向上修正
                 log.error("[对账] 已结束券 Redis 库存缺口已修正! voucherId={}, redis={}, db={}",
                         sv.getVoucherId(), redisStock, dbStock);

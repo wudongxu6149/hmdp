@@ -2,17 +2,23 @@
 
   原子能力：时间窗校验 → 库存校验 → 一人一单 → 扣库存 → 记资格 → 写事务标记
   相比旧版：① 补上秒杀时间窗校验（旧版未开始也能抢）；② 删除 XADD stream.orders（Stream 链路废弃）；
-           ③ key 全部改由 KEYS 传入（Redis Cluster 规范写法，预留集群迁移结构）
+           ③ key 全部由 KEYS 传入；若迁移 Redis Cluster，这些 Key 必须使用同一 hash tag
 
   KEYS[1] 秒杀元数据 Hash  seckill:voucher:{voucherId}（stock/beginTime/endTime，新增秒杀券时预热）
   KEYS[2] 一人一单资格 Set seckill:order:{voucherId}
   KEYS[3] 事务标记         seckill:tx:{orderId}（供 Broker 回查）
+  KEYS[4] 待恢复订单 ZSet  seckill:pending:orders（score 为最早恢复时间）
   ARGV[1] 当前毫秒时间戳（Java 传入，用于时间窗比较）
   ARGV[2] userId
+  ARGV[3] voucherId
+  ARGV[4] orderId
+  ARGV[5] 最早恢复时间（毫秒）
 ]]
+
 local voucherKey = KEYS[1]
 local orderKey = KEYS[2]
 local txKey = KEYS[3]
+local pendingKey = KEYS[4]  --SECKILL_PENDING_ORDER_KEY
 local now = tonumber(ARGV[1])
 local userId = ARGV[2]
 
@@ -38,6 +44,13 @@ if (redis.call('SISMEMBER', orderKey, userId) == 1) then
     return 2
 end
 
+-- 在真正扣库存之前，先检查 pendingKey 这个 Redis Key 的数据类型是不是 ZSet。
+--如果这个 Key 被别人误写成了 String、List、Hash 等类型，就直接报错，不继续往下执行。
+local pendingType = redis.call('TYPE', pendingKey).ok
+if (pendingType ~= 'none' and pendingType ~= 'zset') then
+    return redis.error_reply('invalid seckill pending key type')
+end
+
 -- 4.扣减库存 + 记资格（同一脚本内原子完成）
 redis.call('hincrby', voucherKey, 'stock', -1)
 redis.call('sadd', orderKey, userId)
@@ -45,6 +58,10 @@ redis.call('sadd', orderKey, userId)
 -- 5.事务标记：与上面的扣减在同一 Lua 内原子写入——
 --   标记存在 = Redis 已扣 = 消息必须投递（Broker 回查的唯一事实依据）；TTL 1天远大于回查窗口
 redis.call('set', txKey, '1', 'EX', 86400)
+
+-- 与预扣同一脚本写入持久恢复意图；不设 TTL，只有落库/明确回补后才能移除
+-- score为当前的时间now+恢复时长60s，member为orderId:userId:voucherId
+redis.call('zadd', pendingKey, ARGV[5], ARGV[4] .. ':' .. userId .. ':' .. ARGV[3])
 
 -- 成功
 return 0

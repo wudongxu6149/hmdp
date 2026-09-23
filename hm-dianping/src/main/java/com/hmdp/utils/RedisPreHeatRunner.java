@@ -5,6 +5,7 @@ import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.Shop;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IShopService;
+import com.hmdp.service.IVoucherOrderService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
@@ -35,6 +36,8 @@ public class RedisPreHeatRunner {
     @Resource
     private ISeckillVoucherService seckillVoucherService;
     @Resource
+    private IVoucherOrderService voucherOrderService;
+    @Resource
     private StringRedisTemplate stringRedisTemplate;
 
     /**
@@ -63,7 +66,7 @@ public class RedisPreHeatRunner {
     /**
      * 【阶段4新增】秒杀券元数据预热。
      * 扫描所有未结束的秒杀券（含未开始的），若 Redis 缺少对应 Hash——
-     * 升级前创建的旧券、Redis 数据丢失/被清——则以 DB 为准补写，让两类问题在每次启动时自愈。
+     * 升级前创建的旧券、Redis 数据丢失/被清——则以 DB 为准补写；存在待回补关单时跳过，避免重复加库存。
      *
      * 关键约束【只补缺失、不覆盖已存在】：
      * 活动进行中 Redis 库存可能低于 DB（请求已被 Lua 预扣、订单尚未落库），
@@ -84,6 +87,15 @@ public class RedisPreHeatRunner {
         for (SeckillVoucher sv : list) {
             String key = SECKILL_VOUCHER_KEY + sv.getVoucherId();
             if (Boolean.TRUE.equals(stringRedisTemplate.hasKey(key))) {
+                skipped++;
+                continue;
+            }
+            if (voucherOrderService.query()
+                    .eq("voucher_id", sv.getVoucherId())
+                    .eq("status", 4)
+                    .eq("close_refund_pending", 1)
+                    .count() > 0) {
+                log.error("秒杀券 Redis 库存缺失且存在待回补关单，跳过预热并需人工核对, voucherId={}", sv.getVoucherId());
                 skipped++;
                 continue;
             }

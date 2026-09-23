@@ -69,5 +69,6 @@ rocketmq:
 # 与对账扫表兜底（ReconciliationTask.closeTimeoutOrders），改这一处两条路径同步生效
 seckill:
   pay-timeout-minutes: 5           # 支付超时（关单时长）；测试时可改 1
+  pending-recovery-delay-ms: 60000 # 预扣后 1 分钟仍未落库则允许恢复扫描按原订单号重试
   reconcile-initial-delay-ms: 30000  # 对账首轮延迟
   reconcile-interval-ms: 60000       # 对账间隔

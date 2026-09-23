@@ -30,9 +30,14 @@ public class RedisConstants {
     //lua脚本执行结果凭证，用来给发生异常时候，broker根据UNKNOWN回查这个标记
     public static final String SECKILL_TX_KEY = "seckill:tx:";
 
+    /** Lua 预扣成功后的待落库订单日志；Broker 放弃半消息后仍可据此恢复。 */
+    public static final String SECKILL_PENDING_ORDER_KEY = "seckill:pending:orders";
+
     public static final String SECKILL_RESULT_KEY = "seckill:result:";
     /* 【阶段4新增】Redis 库存退票幂等标记：seckill:refund:{orderId}，防同一消息重放导致重复回补 */
     public static final String SECKILL_REFUND_KEY = "seckill:refund:";
+    /** 已落库订单关单后的 Redis 回补幂等凭证，与未落库退票标记分开。 */
+    public static final String SECKILL_CLOSE_REFUND_KEY = "seckill:close:refund:";
 
     /* 【阶段5新增】多级缓存失效广播频道（Pub/Sub）：更新方发布，所有实例订阅并删除各自 L1 */
     public static final String CACHE_INVALIDATE_TOPIC = "cache:invalidate";

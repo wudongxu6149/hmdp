@@ -6,6 +6,7 @@ import com.hmdp.dto.SeckillMessage;
 import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.VoucherOrderMapper;
+import com.hmdp.mq.SeckillPendingOrderStore;
 import com.hmdp.mq.SeckillResultStore;
 import com.hmdp.mq.SeckillTxContext;
 import com.hmdp.service.ISeckillVoucherService;
@@ -18,8 +19,10 @@ import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.messaging.Message;
 import org.springframework.messaging.support.MessageBuilder;
 import org.springframework.stereotype.Service;
@@ -31,6 +34,7 @@ import javax.annotation.Resource;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.Arrays;
 
 import static com.hmdp.utils.MQConstants.TOPIC_SECKILL_ORDER;
 import static com.hmdp.utils.RedisConstants.*;
@@ -40,8 +44,7 @@ import static com.hmdp.utils.RedisConstants.*;
  * <p>
  * 【阶段2 重构总览】秒杀写链路：Redis Stream（假 MQ）→ RocketMQ 事务消息。
  * 半消息 → 本地事务内执行秒杀 Lua（时间窗/库存/一人一单/预扣库存/记资格/写事务标记）
- * → 成功 COMMIT（消息必然可消费）；失败 ROLLBACK（Redis 原子，无残留）。
- * 「Redis 扣减」与「消息可消费」被绑成原子结果，修复旧链路"扣了库存消息丢了"的缺陷。
+ * → 成功 COMMIT；失败 ROLLBACK。Lua 同时留下待恢复订单，兜底 Broker 最终放弃半消息的情况。
  * <p>
  * 消费者落库（SeckillOrderConsumer → landSeckillOrder）失败自动重试 16 次，
  * 仍失败由死信消费者（SeckillOrderDlqConsumer）回补库存与资格。
@@ -50,6 +53,13 @@ import static com.hmdp.utils.RedisConstants.*;
 @Service
 @Slf4j
 public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
+
+    private static final DefaultRedisScript<Long> REFUND_SCRIPT = new DefaultRedisScript<>();
+
+    static {
+        REFUND_SCRIPT.setLocation(new ClassPathResource("scripts/refund_seckill.lua"));
+        REFUND_SCRIPT.setResultType(Long.class);
+    }
 
     @Resource
     private ISeckillVoucherService seckillVoucherService;
@@ -64,6 +74,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private RocketMQTemplate rocketMQTemplate;
     @Resource
     private SeckillResultStore seckillResultStore;
+    @Resource
+    private SeckillPendingOrderStore pendingOrderStore;
+    @Resource
+    private CloseRefundService closeRefundService;
 
     /**
      * 【阶段3新增】未支付订单超时关单时长（分钟）。
@@ -101,7 +115,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             rocketMQTemplate.sendMessageInTransaction(TOPIC_SECKILL_ORDER, message, ctx);
         } catch (Exception e) {
             // 半消息发送失败时 Lua 尚未执行（本地事务在发送成功后才运行），Redis 无扣减，无需回补；
-            // 若本地事务已执行而后续异常，状态由 UNKNOWN → Broker 回查事务标记收敛，不会丢库存
+            // 若本地事务已执行而后续异常，Broker 回查标记；超出回查窗口则由恢复任务处理预扣记录
             log.error("[事务消息] 发送失败, orderId={}", orderId, e);
             return Result.fail("系统繁忙，请稍后重试");
         }
@@ -129,7 +143,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     /**
      * 【阶段2 重构】秒杀订单落库，取代旧 createVoucherOrder（Stream 消费+Redisson锁+先查后插）。
-     * 四道防线：L0 orderId 幂等 → L2 Redisson 锁 → L2 业务查重(active_flag=0) → L3 DB 唯一索引。
+     * 四道防线：Redisson 锁 → orderId 幂等 → 业务查重(active_flag=0) → DB 唯一索引。
      * 整个方法在一个事务里：Redis 成功标记和超时消息只在数据库事务提交后写入。
      */
     @Override
@@ -139,73 +153,81 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         Long userId = msg.getUserId();
         Long voucherId = msg.getVoucherId();
 
-        // L0 幂等：同一 orderId 的消息重投（消费者重试/rebalance）直接确认，结果兜底置成功
+        // 正常消费、恢复扫描和 DLQ 共用用户锁。锁须持有到 DB 事务完成，不能在方法返回时提前释放。
+        RLock lock = redissonClient.getLock("lock:order:" + userId);
+        lock.lock();
+
+        //事务释放后解锁（放前面来使得锁尽可能的早注册）
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCompletion(int status) {
+                lock.unlock();
+            }
+        });
+
+
+        // 在锁内首次查询，避免先读建立旧事务快照，再拿锁后仍读不到别的实例刚提交的订单。
         VoucherOrder existingOrder = getById(orderId);
 
-        //发生了数据回滚，消息没有成功发送，导致消息重投
-        if (existingOrder.getStatus() == 1) {
-            log.info("[幂等命中] 订单已落库, orderId={}", orderId);
-            markSuccessAndScheduleTimeoutAfterCommit(msg,
-                    existingOrder.getCreateTime().plusMinutes(payTimeoutMinutes));
+        //防止消息重复投递
+        if (existingOrder != null) {
+
+            if (existingOrder.getStatus() == 1) {
+                log.info("[幂等命中] 订单已落库, orderId={}", orderId);
+                markSuccessAndScheduleTimeoutAfterCommit(msg,
+                        existingOrder.getCreateTime().plusMinutes(payTimeoutMinutes));
+            } else {
+                //如果当前订单不是待支付状态，说明已经被处理过了，移除ZSet中的恢复记录
+                pendingOrderStore.complete(msg);
+            }
             return;
         }
 
-        // L2 并发防线：按用户加分布式锁。入口 Lua 的 SISMEMBER 原子判重保证同一用户对同一券
-        // 只会产生一条消息，此锁专防异常场景（rebalance 重分配）下同一消息被并发重复投递
-        RLock lock = redissonClient.getLock("lock:order:" + userId);
-        lock.lock();
-        try {
-            // L2 业务查重：已有【有效订单】（active_flag=0）→ 本消息按重复下单终态化。
-            // 已取消的历史单不占位——取消后可以重新抢购
-            // 【阶段4补漏】Lua 已为本消息预扣了 Redis 库存，但本消息注定不会产生订单（幻影扣减），
-            // 必须退票：只退库存、不 SREM 资格——用户的资格由其已有有效订单合法持有
-            int count = query().eq("user_id", userId).eq("voucher_id", voucherId).eq("active_flag", 0).count();
-            if (count > 0) {
-                log.info("[查重命中] userId={}, voucherId={} 已有有效订单, 退回幻影预扣库存", userId, voucherId);
-                refundRedisStockOnce(orderId, voucherId);
-                seckillResultStore.mark(orderId, "FAILED:请勿重复下单");
-                return;
-            }
-
-            // 乐观扣减库存：UPDATE ... SET stock=stock-1 WHERE voucher_id=? AND stock>0
-            boolean success = seckillVoucherService.update()
-                    .setSql("stock = stock - 1")
-                    .eq("voucher_id", voucherId).gt("stock", 0)
-                    .update();
-            if (!success) {
-                // 【数据漂移】Redis 判定有资格但 DB 库存不足：回补 Redis 库存 + 解除资格 + 终态化 + 告警，
-                // 【阶段4补漏】回补走幂等退票（setIfAbsent 门闩），防同一消息并发重放导致库存重复+1；
-                // SREM 幂等故无需门闩——此处释放资格是因为资格背后没有库存支撑，用户应可重试
-                log.error("[库存漂移] Redis/DB 库存不一致, orderId={}, voucherId={}", orderId, voucherId);
-                refundRedisStockOnce(orderId, voucherId);
-                stringRedisTemplate.opsForSet().remove(SECKILL_ORDER_KEY + voucherId, userId.toString()); //这一步移除lua脚本中的资格
-                seckillResultStore.mark(orderId, "FAILED:库存不足");
-                return;
-            }
-
-            // 插入订单（未支付）。activeFlag 不设置 → MP 跳过该列 → DB 默认值 0（有效单）
-            VoucherOrder order = new VoucherOrder();
-            order.setId(orderId).setUserId(userId).setVoucherId(voucherId).setPayType(1).setStatus(1);
-            try {
-                save(order);
-            } catch (DuplicateKeyException e) {
-                // L3 兜底：唯一索引 uk_user_voucher_active 拦截。以 orderId 是否已落库区分两种情况：
-                // 本单已存在 → 并发重投，按幂等成功终态化；他单占位 → 重复下单。
-                // 无论如何都必须抛出：回滚本次事务（含上面 DB 扣掉的库存，防止双扣），
-                // 消息重投后走 L0 幂等 / 查重分支正常确认
-                if (getById(orderId) != null) {
-                    log.info("[唯一键冲突] 本订单已存在，等待消息重投收敛, orderId={}", orderId);
-                } else {
-                    log.info("[唯一键冲突] 已有其他有效订单，等待消息重投收敛, orderId={}", orderId);
-                }
-                throw e;
-            }
-
-            // 事务提交成功后才对外暴露 SUCCESS，并启动超时关单计时。
-            markSuccessAndScheduleTimeoutAfterCommit(msg, LocalDateTime.now().plusMinutes(payTimeoutMinutes));
-        } finally {
-            lock.unlock();
+        // 检查已由 DLQ死信队列补偿 或失败分支退票的消息，不允许迟到的事务消息/恢复扫描重新落库。
+        if (Boolean.TRUE.equals(stringRedisTemplate.hasKey(SECKILL_REFUND_KEY + orderId))) {
+            seckillResultStore.mark(orderId, "FAILED:已回补");
+            pendingOrderStore.complete(msg);
+            return;
         }
+
+        // 已有其他有效订单时，只退本次预扣库存，不移除该用户已有订单的购买资格。
+        int count = query().eq("user_id", userId).eq("voucher_id", voucherId).eq("active_flag", 0).count();
+        if (count > 0) {
+            log.info("[查重命中] userId={}, voucherId={} 已有有效订单, 退回幻影预扣库存", userId, voucherId);
+            refundRedisStockOnce(orderId, voucherId, userId, false);
+            seckillResultStore.mark(orderId, "FAILED:请勿重复下单");
+            pendingOrderStore.complete(msg);
+            return;
+        }
+
+        // 乐观扣减库存：UPDATE ... SET stock=stock-1 WHERE voucher_id=? AND stock>0
+        boolean success = seckillVoucherService.update()
+                .setSql("stock = stock - 1")
+                .eq("voucher_id", voucherId).gt("stock", 0)
+                .update();
+        if (!success) {
+            log.error("[库存漂移] Redis/DB 库存不一致, orderId={}, voucherId={}", orderId, voucherId);
+            refundRedisStockOnce(orderId, voucherId, userId, true);
+            seckillResultStore.mark(orderId, "FAILED:库存不足");
+            pendingOrderStore.complete(msg);
+            return;
+        }
+
+        // 插入订单（未支付）。activeFlag 不设置 → MP 跳过该列 → DB 默认值 0（有效单）
+        VoucherOrder order = new VoucherOrder();
+        order.setId(orderId).setUserId(userId).setVoucherId(voucherId).setPayType(1).setStatus(1);
+        try {
+            save(order);
+        } catch (DuplicateKeyException e) {
+            // DB 唯一索引兜底；抛异常回滚刚才的数据库扣库，重投再按 orderId 幂等或查重处理。
+            log.info("[唯一键冲突] 等待消息重投收敛, orderId={}", orderId);
+            throw e;
+        }
+
+        // 事务提交成功后才对外暴露 SUCCESS，并启动超时关单计时。
+        markSuccessAndScheduleTimeoutAfterCommit(msg, LocalDateTime.now().plusMinutes(payTimeoutMinutes));
+
+
     }
 
     /* ==================== 死信补偿 ==================== */
@@ -220,18 +242,21 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         Long orderId = msg.getOrderId();
         Long userId = msg.getUserId();
         Long voucherId = msg.getVoucherId();
-        if (getById(orderId) != null) {
-            log.warn("[DLQ] 订单已存在，无需补偿, orderId={}", orderId);
-            return;
+        RLock lock = redissonClient.getLock("lock:order:" + userId);
+        lock.lock();
+        try {
+            if (getById(orderId) != null) {
+                log.warn("[DLQ] 订单已存在，无需补偿, orderId={}", orderId);
+                return;
+            }
+            refundRedisStockOnce(orderId, voucherId, userId, true);
+            seckillResultStore.mark(orderId, "FAILED:落库失败已回补");
+            pendingOrderStore.complete(msg);
+            log.error("[DLQ补偿] 订单落库最终失败，已回补库存与资格, orderId={}, userId={}, voucherId={}",
+                    orderId, userId, voucherId);
+        } finally {
+            lock.unlock();
         }
-        //回补走幂等退票（防 DLQ 消息重放导致库存重复+1）；SREM 幂等无需门闩
-
-        refundRedisStockOnce(orderId, voucherId);   //恢复库存
-        stringRedisTemplate.opsForSet().remove(SECKILL_ORDER_KEY + voucherId, userId.toString()); //恢复购买资格
-
-        seckillResultStore.mark(orderId, "FAILED:落库失败已回补");
-        log.error("[DLQ补偿] 订单落库最终失败，已回补库存与资格, orderId={}, userId={}, voucherId={}",
-                orderId, userId, voucherId);
     }
 
     /* ==================== 下单结果轮询 ==================== */
@@ -320,15 +345,14 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             return;
         }
         // 已到期：执行关单（内部调用与本方法同事务）
-        tryCloseOrder(orderId);
+        this.tryCloseOrder(orderId);
     }
 
     /**
      * CAS 关单并回补资源（阶段4扫表任务会复用此方法）。
      * status 1→4 且 active_flag=本单id：active_flag 置值后该行退出唯一索引 uk_user_voucher_active，
      * 一人一单的"有效订单"空位释放 → 用户可重新抢购（方案A语义）。
-     * 关单成功后回补三件套：DB 库存+1 → Redis 库存+1 → 解除资格 SREM。
-     * 顺序刻意 DB 在前：若中途崩溃，宁可 Redis 库存短暂偏高（多放行的请求会被 Lua/查重拦住），不可偏低（少卖）
+     * DB 关单、库存+1及待回补标记同事务提交；Redis 回补仅在提交后执行，失败由定时任务重试。
      */
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -343,9 +367,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             log.info("[关单] 订单已关闭/支付, orderId={}, voucherId={}", orderId, order.getVoucherId());
             return false;
         }
+
+        //更新数据库中对于订单的信息
         boolean closed = update()
                 .set("status", 4)                    // 已取消
                 .set("active_flag", order.getId())   // 退出唯一约束 → 释放一人一单位
+                .set("close_refund_pending", 1)
                 .eq("id", orderId)
                 .eq("status", 1)                     // CAS：只关未支付订单
                 .update();
@@ -355,17 +382,26 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             return false;
         }
         // 回补 DB 库存
-        seckillVoucherService.update()
+        boolean stockRefunded = seckillVoucherService.update()
                 .setSql("stock = stock + 1")
                 .eq("voucher_id", order.getVoucherId())
                 .update();
-        // 回补 Redis 库存
-        stringRedisTemplate.opsForHash().increment(SECKILL_VOUCHER_KEY + order.getVoucherId(), "stock", 1);
-        // 解除一人一单资格（用户可重新抢购,移除set中的用户记录）
-        stringRedisTemplate.opsForSet().remove(SECKILL_ORDER_KEY + order.getVoucherId(), order.getUserId().toString());
-        // 轮询侧同步终态
-        seckillResultStore.mark(orderId, "CLOSED:超时未支付");
-        log.info("[关单] 已关闭并回补, orderId={}, voucherId={}", orderId, order.getVoucherId());
+        if (!stockRefunded) {
+            throw new IllegalStateException("关单回补数据库库存失败, orderId=" + orderId);
+        }
+
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                try {
+                    closeRefundService.apply(orderId);
+                } catch (Exception e) {
+                    // DB 已提交，异常不能回滚；待处理标记保留，交给定时任务重试。
+                    log.error("[关单] Redis 回补失败，等待定时重试, orderId={}", orderId, e);
+                }
+            }
+        });
+        log.info("[关单] 数据库已标记关闭，Redis 回补待提交后执行, orderId={}", orderId);
         return true;
     }
 
@@ -380,6 +416,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 //先发消息
                 sendTimeoutMessage(msg, due);
                 seckillResultStore.mark(msg.getOrderId(), "SUCCESS");
+                pendingOrderStore.complete(msg);
             }
         });
     }
@@ -416,16 +453,19 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     /**
      * 【阶段4补漏】幂等退票：把本消息在 Lua 中预扣的 Redis 库存 +1 回去。
-     * 用 setIfAbsent 门闩（seckill:refund:{orderId}，TTL 1天）保证同一 orderId 只退一次——
+     * Lua 将退票标记、库存 +1 和可选的资格释放原子执行，保证同一 orderId 只退一次——
      * 消息重放/并发重投时不会重复加库存。三个调用方：查重命中（幻影扣减退回）、
      * 库存漂移（回补+释放资格）、死信补偿（最终失败回补）。
      * 使用场景：数据库中没有这个orderId的订单，只需要恢复Redis中扣减的库存和资格即可
      */
-    private void refundRedisStockOnce(Long orderId, Long voucherId) {
-        Boolean first = stringRedisTemplate.opsForValue().setIfAbsent(
-                SECKILL_REFUND_KEY + orderId, "1", Duration.ofDays(1));
-        if (Boolean.TRUE.equals(first)) {
-            stringRedisTemplate.opsForHash().increment(SECKILL_VOUCHER_KEY + voucherId, "stock", 1);
-        }
+    private void refundRedisStockOnce(Long orderId, Long voucherId, Long userId, boolean releaseQualification) {
+        stringRedisTemplate.execute(REFUND_SCRIPT,
+                                    //KEYS
+                                    Arrays.asList(SECKILL_REFUND_KEY + orderId,
+                                            SECKILL_VOUCHER_KEY + voucherId,
+                                            SECKILL_ORDER_KEY + voucherId),
+                                    //ARG
+                                    userId.toString(),
+                                    releaseQualification ? "1" : "0");
     }
 }

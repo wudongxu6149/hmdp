@@ -21,8 +21,9 @@ import static com.hmdp.utils.RedisConstants.SECKILL_TX_KEY;
  *
  * 解决的问题：旧链路「先扣 Redis 库存、再发消息」两步不原子——发送失败/进程崩溃会出现
  * 库存已扣但订单消息丢失。现在 Lua（扣库存+写事务标记）在本地事务内执行：
- *   成功 → COMMIT，消息必然可消费；失败 → ROLLBACK，Lua 原子回滚 Redis 无残留；
+ *   成功 → COMMIT；资格不通过 → ROLLBACK，此时 Lua 未执行任何写操作；
  * 生产者宕机 → Broker 回查事务标记，标记与扣减在同一个 Lua 里原子写入，不存在"已扣无标记"。
+ * Broker 达到回查上限仍放弃半消息时，恢复任务按 Lua 留下的订单记录重试落库。
  */
 @Slf4j
 @Component
@@ -62,7 +63,7 @@ public class SeckillTxListener implements RocketMQLocalTransactionListener {
         } catch (Exception e) {
             // Lua 执行异常时 Redis 状态未知（脚本可能已生效）→ 必须返回 UNKNOWN 交由回查裁决。
             // 盲目 ROLLBACK 会出现"库存已扣但消息被丢弃"；UNKNOWN 下 Broker 反复回查，
-            // 标记在 → COMMIT 落库；标记不在 → 达到回查上限后丢弃半消息（等效回滚）
+            // Broker 最终丢弃半消息时，恢复任务仍能找到 Lua 同时写入的预扣记录。
             log.error("[事务消息] 本地事务异常, orderId={}", ctx.getOrderId(), e);
             ctx.setLuaResult(-1);
             return RocketMQLocalTransactionState.UNKNOWN;

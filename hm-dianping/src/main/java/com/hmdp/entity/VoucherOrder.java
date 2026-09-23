@@ -82,5 +82,8 @@ public class VoucherOrder implements Serializable {
      */
     private Long activeFlag;
 
+    /** 关单事务提交后仍待完成 Redis 回补：1=待处理，0=无需处理或已完成。 */
+    private Integer closeRefundPending;
+
 
 }
