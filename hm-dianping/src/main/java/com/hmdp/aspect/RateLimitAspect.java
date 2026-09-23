@@ -44,7 +44,7 @@ public class RateLimitAspect {
 
     @Around("@annotation(rateLimit)")
     public Object rateLimit(ProceedingJoinPoint pjp, RateLimit rateLimit) throws Throwable {
-
+        long startNs = System.nanoTime();
         RateLimit.LimitType limitType = rateLimit.limitType();
         String dimension = resolveDimension(limitType);
         // Key 格式：rate_limit:{业务}:{限流类型}[:{用户ID/IP}]
@@ -68,7 +68,17 @@ public class RateLimitAspect {
                     key, rateLimit.window(), rateLimit.maxCount());
             throw new BizException("请求过于频繁，请稍后再试");
         }
-        return pjp.proceed();
+        long businessStartNs = System.nanoTime();
+        try {
+            return pjp.proceed();
+        } finally {
+            long endNs = System.nanoTime();
+            if (endNs - startNs >= 500_000_000L) {
+                log.warn("[限流与业务慢请求] rateMs={}, businessMs={}",
+                        (businessStartNs - startNs) / 1_000_000,
+                        (endNs - businessStartNs) / 1_000_000);
+            }
+        }
     }
 
     /**

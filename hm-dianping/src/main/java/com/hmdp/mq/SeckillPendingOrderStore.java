@@ -69,11 +69,14 @@ public class SeckillPendingOrderStore {
         if (parts.length != 3) {
             throw new IllegalArgumentException("非法秒杀恢复记录: " + member);
         }
+        //score为当前的时间now+恢复时长60s，member为orderId:userId:voucherId
         return new SeckillMessage(Long.valueOf(parts[2]), Long.valueOf(parts[1]), Long.valueOf(parts[0]));
     }
 
     /*
     * 尝试失败后延迟再试
+    *
+    * score为当前的时间now+恢复时长60s，member为orderId:userId:voucherId
     * */
     public void retryLater(String member, long due) {
         // 与正常消费者清理并发时不能重新插入已完成的订单。

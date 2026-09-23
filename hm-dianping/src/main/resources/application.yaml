@@ -41,7 +41,7 @@ mybatis-plus:
 
 logging:
   level:
-    com.hmdp: debug
+    com.hmdp: info
 
 
 # 店铺布隆过滤器：保护“缓存完全缺失后的数据库回源”，解决随机非法 ID 造成的缓存穿透。
@@ -68,7 +68,7 @@ rocketmq:
 # pay-timeout-minutes 同时被两条关单路径读取：延迟消息主链路（handleOrderTimeout/tryCloseOrder）
 # 与对账扫表兜底（ReconciliationTask.closeTimeoutOrders），改这一处两条路径同步生效
 seckill:
-  pay-timeout-minutes: 5           # 支付超时（关单时长）；测试时可改 1
+  pay-timeout-minutes: 1           # 支付超时（关单时长）；测试时可改 1
   pending-recovery-delay-ms: 60000 # 预扣后 1 分钟仍未落库则允许恢复扫描按原订单号重试
   reconcile-initial-delay-ms: 30000  # 对账首轮延迟
   reconcile-interval-ms: 60000       # 对账间隔

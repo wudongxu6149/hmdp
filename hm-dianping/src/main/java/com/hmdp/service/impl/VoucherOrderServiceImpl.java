@@ -27,6 +27,7 @@ import org.springframework.messaging.Message;
 import org.springframework.messaging.support.MessageBuilder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
@@ -78,6 +79,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private SeckillPendingOrderStore pendingOrderStore;
     @Resource
     private CloseRefundService closeRefundService;
+    @Resource
+    private TransactionTemplate transactionTemplate;
 
     /**
      * 【阶段3新增】未支付订单超时关单时长（分钟）。
@@ -96,6 +99,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      */
     @Override
     public Result seckillVoucher(Long voucherId) {
+        long startNs = System.nanoTime();
         UserDTO user = UserHolder.getUser();
         Long userId = user.getId();
         // 订单号仍由 RedisIdWorker 生成（时间戳+Redis序列，跨实例严格递增），
@@ -111,6 +115,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 // ORDER_ID 放消息头：Broker 回查(checkLocalTransaction)时据此定位 Redis 事务标记
                 .setHeader("ORDER_ID", String.valueOf(orderId))
                 .build();
+        long mqStartNs = System.nanoTime();
         try {
             rocketMQTemplate.sendMessageInTransaction(TOPIC_SECKILL_ORDER, message, ctx);
         } catch (Exception e) {
@@ -118,6 +123,13 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             // 若本地事务已执行而后续异常，Broker 回查标记；超出回查窗口则由恢复任务处理预扣记录
             log.error("[事务消息] 发送失败, orderId={}", orderId, e);
             return Result.fail("系统繁忙，请稍后重试");
+        }
+        long endNs = System.nanoTime();
+        if (endNs - startNs >= 200_000_000L) {
+            log.warn("[秒杀入口慢请求] orderId={}, totalMs={}, beforeMqMs={}, mqMs={}",
+                    orderId, (endNs - startNs) / 1_000_000,
+                    (mqStartNs - startNs) / 1_000_000,
+                    (endNs - mqStartNs) / 1_000_000);
         }
 
         // Lua 结果：0=有资格(已预扣) 1=库存不足 2=重复下单 3=未开始 4=已结束 -1=执行异常(状态未知)
@@ -321,7 +333,6 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * 仍使用同一个绝对时间重新写入时间轮。这样既保留消费端的防御性校验，也不会退化为经典延迟等级。
      */
     @Override
-    @Transactional(rollbackFor = Exception.class)
     public void handleOrderTimeout(SeckillMessage msg) {
         Long orderId = msg.getOrderId();
         VoucherOrder order = getById(orderId);
@@ -344,7 +355,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             log.info("[关单] 未到期，重投剩余 {}ms, orderId={}", remainMs, orderId);
             return;
         }
-        // 已到期：执行关单（内部调用与本方法同事务）
+        // 已到期：关单方法仅在数据库更新期间持有事务
         this.tryCloseOrder(orderId);
     }
 
@@ -355,8 +366,21 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * DB 关单、库存+1及待回补标记同事务提交；Redis 回补仅在提交后执行，失败由定时任务重试。
      */
     @Override
-    @Transactional(rollbackFor = Exception.class)
     public boolean tryCloseOrder(Long orderId) {
+        Boolean closed = transactionTemplate.execute(status -> closeOrderInDb(orderId));
+        if (!Boolean.TRUE.equals(closed)) {
+            return false;
+        }
+        try {
+            closeRefundService.apply(orderId);
+        } catch (Exception e) {
+            // DB 已提交，异常不能回滚；待处理标记保留，交给定时任务重试。
+            log.error("[关单] Redis 回补失败，等待定时重试, orderId={}", orderId, e);
+        }
+        return true;
+    }
+
+    private boolean closeOrderInDb(Long orderId) {
         VoucherOrder order = getById(orderId);
         if (order == null) {
             log.info("[关单] 订单不存在, orderId={}", orderId);
@@ -372,9 +396,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         boolean closed = update()
                 .set("status", 4)                    // 已取消
                 .set("active_flag", order.getId())   // 退出唯一约束 → 释放一人一单位
-                .set("close_refund_pending", 1)
+                .set("close_refund_pending", 1)     //标记是否退款
                 .eq("id", orderId)
-                .eq("status", 1)                     // CAS：只关未支付订单
+                .eq("status", 1)         // CAS：只关未支付订单
                 .update();
         if (!closed) {
             // 并发竞争败者（恰好此刻支付成功 / 已被其他线程关闭）
@@ -390,18 +414,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             throw new IllegalStateException("关单回补数据库库存失败, orderId=" + orderId);
         }
 
-        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-            @Override
-            public void afterCommit() {
-                try {
-                    closeRefundService.apply(orderId);
-                } catch (Exception e) {
-                    // DB 已提交，异常不能回滚；待处理标记保留，交给定时任务重试。
-                    log.error("[关单] Redis 回补失败，等待定时重试, orderId={}", orderId, e);
-                }
-            }
-        });
-        log.info("[关单] 数据库已标记关闭，Redis 回补待提交后执行, orderId={}", orderId);
+        log.info("[关单] 数据库已标记关闭，等待事务提交后回补 Redis, orderId={}", orderId);
         return true;
     }
 

@@ -29,7 +29,7 @@ import static com.hmdp.utils.RedisConstants.SECKILL_VOUCHER_KEY;
  *
  * 五个子任务（每轮依次执行，任一失败不影响其余，下一轮重试）：
  *   ① 恢复 Lua 已预扣但未落库的订单，兜底半消息被最终放弃的情况
- *   ② 重试已提交关单的 Redis 回补
+ *   ② 重试数据库中已经关单，但是redis库存尚未回补的情况
  *   ③ 库存对账：以订单表+DB库存为账本，校正 Redis 库存（含"只修虚高"的进行中保护，见方法注释）
  *   ④ 扫表关单：status=1 且超时的订单走 tryCloseOrder（复用阶段3的 CAS 关单+回补），
  *      兜底"延迟消息丢失/关单消费者不可用"导致的订单永久冻结库存
@@ -125,6 +125,9 @@ public class ReconciliationTask {
                 .eq("close_refund_pending", 1)
                 .last("LIMIT " + CLOSE_REFUND_BATCH_LIMIT)
                 .list();
+        if(pending==null || pending.isEmpty()){
+            return ;
+        }
         for (VoucherOrder order : pending) {
             try {
                 closeRefundService.apply(order.getId());

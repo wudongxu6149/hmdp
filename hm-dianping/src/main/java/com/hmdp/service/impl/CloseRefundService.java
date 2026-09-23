@@ -8,8 +8,6 @@ import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.Resource;
 import java.util.Arrays;
@@ -35,8 +33,7 @@ public class CloseRefundService {
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
-    /** 开启独立事务：原关单事务已经提交，不能把“清除待办”写进尚未结束的旧事务。 */
-    @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
+    /** 先查待办，Redis 回补后再单独清除数据库标记，避免等待 Redis 时占用数据库连接。 */
     public void apply(Long orderId) {
 
         VoucherOrder order = voucherOrderMapper.selectById(orderId);
@@ -51,7 +48,7 @@ public class CloseRefundService {
                 Arrays.asList(SECKILL_CLOSE_REFUND_KEY + orderId,   //退款标记
                         SECKILL_VOUCHER_KEY + order.getVoucherId(), //优惠券标记->恢复库存
                         SECKILL_ORDER_KEY + order.getVoucherId(), //用户购买资格标记
-                        SECKILL_RESULT_KEY + orderId),
+                        SECKILL_RESULT_KEY + orderId), //下单结果标记
                 order.getUserId().toString(),
                 String.valueOf(MQConstants.RESULT_TTL_SECONDS));
 
@@ -59,6 +56,7 @@ public class CloseRefundService {
             throw new IllegalStateException("关单 Redis 回补没有返回结果, orderId=" + orderId);
         }
 
+        //更新数据库中的refund字段为0，表明库存回补成功
         voucherOrderMapper.update(null, new UpdateWrapper<VoucherOrder>()
                 .set("close_refund_pending", 0)
                 .eq("id", orderId)

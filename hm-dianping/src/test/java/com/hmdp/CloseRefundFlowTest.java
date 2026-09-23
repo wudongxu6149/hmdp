@@ -16,10 +16,12 @@ import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.test.util.ReflectionTestUtils;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.TransactionStatus;
+import org.springframework.transaction.support.TransactionCallback;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -31,36 +33,37 @@ class CloseRefundFlowTest {
     void dbRollbackDoesNotTriggerRedisRefund() {
         CloseRefundService refundService = mock(CloseRefundService.class);
         VoucherOrderServiceImpl service = serviceWithDbUpdates(true, refundService);
+        TransactionTemplate template = (TransactionTemplate) ReflectionTestUtils.getField(service, "transactionTemplate");
+        doAnswer(invocation -> {
+            TransactionCallback<?> callback = invocation.getArgument(0);
+            callback.doInTransaction(mock(TransactionStatus.class));
+            throw new IllegalStateException("数据库提交失败");
+        }).when(template).execute(any());
 
-        TransactionSynchronizationManager.initSynchronization();
-        try {
-            assertTrue(service.tryCloseOrder(100L));
-            verifyNoInteractions(refundService);
-            for (TransactionSynchronization callback : TransactionSynchronizationManager.getSynchronizations()) {
-                callback.afterCompletion(TransactionSynchronization.STATUS_ROLLED_BACK);
-            }
-            verifyNoInteractions(refundService);
-        } finally {
-            TransactionSynchronizationManager.clearSynchronization();
-        }
+        assertThrows(IllegalStateException.class, () -> service.tryCloseOrder(100L));
+        verifyNoInteractions(refundService);
     }
 
     @Test
     void refundStartsOnlyAfterDbCommit() {
         CloseRefundService refundService = mock(CloseRefundService.class);
         VoucherOrderServiceImpl service = serviceWithDbUpdates(true, refundService);
+        AtomicBoolean inTransaction = new AtomicBoolean();
+        TransactionTemplate template = (TransactionTemplate) ReflectionTestUtils.getField(service, "transactionTemplate");
+        doAnswer(invocation -> {
+            inTransaction.set(true);
+            TransactionCallback<?> callback = invocation.getArgument(0);
+            Object result = callback.doInTransaction(mock(TransactionStatus.class));
+            inTransaction.set(false);
+            return result;
+        }).when(template).execute(any());
+        doAnswer(invocation -> {
+            assertFalse(inTransaction.get());
+            return null;
+        }).when(refundService).apply(100L);
 
-        TransactionSynchronizationManager.initSynchronization();
-        try {
-            assertTrue(service.tryCloseOrder(100L));
-            verifyNoInteractions(refundService);
-            for (TransactionSynchronization callback : TransactionSynchronizationManager.getSynchronizations()) {
-                callback.afterCommit();
-            }
-            verify(refundService).apply(100L);
-        } finally {
-            TransactionSynchronizationManager.clearSynchronization();
-        }
+        assertTrue(service.tryCloseOrder(100L));
+        verify(refundService).apply(100L);
     }
 
     @Test
@@ -69,16 +72,8 @@ class CloseRefundFlowTest {
         doThrow(new IllegalStateException("Redis 不可用")).when(refundService).apply(100L);
         VoucherOrderServiceImpl service = serviceWithDbUpdates(true, refundService);
 
-        TransactionSynchronizationManager.initSynchronization();
-        try {
-            assertTrue(service.tryCloseOrder(100L));
-            for (TransactionSynchronization callback : TransactionSynchronizationManager.getSynchronizations()) {
-                assertDoesNotThrow(callback::afterCommit);
-            }
-            verify(refundService).apply(100L);
-        } finally {
-            TransactionSynchronizationManager.clearSynchronization();
-        }
+        assertTrue(service.tryCloseOrder(100L));
+        verify(refundService).apply(100L);
     }
 
     @Test
@@ -86,14 +81,8 @@ class CloseRefundFlowTest {
         CloseRefundService refundService = mock(CloseRefundService.class);
         VoucherOrderServiceImpl service = serviceWithDbUpdates(false, refundService);
 
-        TransactionSynchronizationManager.initSynchronization();
-        try {
-            assertThrows(IllegalStateException.class, () -> service.tryCloseOrder(100L));
-            assertTrue(TransactionSynchronizationManager.getSynchronizations().isEmpty());
-            verifyNoInteractions(refundService);
-        } finally {
-            TransactionSynchronizationManager.clearSynchronization();
-        }
+        assertThrows(IllegalStateException.class, () -> service.tryCloseOrder(100L));
+        verifyNoInteractions(refundService);
     }
 
     @Test
@@ -180,6 +169,12 @@ class CloseRefundFlowTest {
         when(voucherService.update()).thenReturn(stockUpdate);
         ReflectionTestUtils.setField(service, "seckillVoucherService", voucherService);
         ReflectionTestUtils.setField(service, "closeRefundService", refundService);
+        TransactionTemplate template = mock(TransactionTemplate.class);
+        when(template.execute(any())).thenAnswer(invocation -> {
+            TransactionCallback<?> callback = invocation.getArgument(0);
+            return callback.doInTransaction(mock(TransactionStatus.class));
+        });
+        ReflectionTestUtils.setField(service, "transactionTemplate", template);
         return service;
     }
 
