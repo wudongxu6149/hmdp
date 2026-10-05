@@ -1,0 +1,160 @@
+name: hmdp
+
+services:
+  mysql:
+    image: mysql:8.0.45
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: hmdp
+      MYSQL_USER: hmdp
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-123456}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+      TZ: Asia/Shanghai
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_general_ci", "--default-time-zone=+08:00"]
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./hm-dianping/src/main/resources/db:/bootstrap:ro
+      - ./deploy/mysql/init-db.sh:/docker-entrypoint-initdb.d/01-init-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_PASSWORD\" mysql --protocol=TCP -h 127.0.0.1 -u hmdp -D hmdp -e 'SELECT active_flag, close_refund_pending FROM tb_voucher_order LIMIT 0' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-123456}
+      TZ: Asia/Shanghai
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  rocketmq-namesrv:
+    image: apache/rocketmq:5.5.0
+    restart: unless-stopped
+    environment:
+      HEAP_OPTS: "-Xms128m -Xmx256m -Xmn64m"
+      JAVA_OPT_EXT: "-Duser.timezone=Asia/Shanghai"
+      TZ: Asia/Shanghai
+    command: ["sh", "mqnamesrv"]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/9876"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  rocketmq-volume-init:
+    image: apache/rocketmq:5.5.0
+    user: "0:0"
+    restart: "no"
+    command: ["sh", "-c", "chown 3000:3000 /home/rocketmq/store /home/rocketmq/logs"]
+    volumes:
+      - rocketmq-store:/home/rocketmq/store
+      - rocketmq-logs:/home/rocketmq/logs
+
+  rocketmq-broker:
+    image: apache/rocketmq:5.5.0
+    restart: unless-stopped
+    environment:
+      NAMESRV_ADDR: rocketmq-namesrv:9876
+      HEAP_OPTS: "-Xms256m -Xmx512m -Xmn128m -XX:MaxDirectMemorySize=256m"
+      JAVA_OPT_EXT: "-Duser.timezone=Asia/Shanghai"
+      TZ: Asia/Shanghai
+    command: ["sh", "mqbroker", "-c", "/etc/rocketmq/broker.conf"]
+    depends_on:
+      rocketmq-namesrv:
+        condition: service_healthy
+      rocketmq-volume-init:
+        condition: service_completed_successfully
+    volumes:
+      - rocketmq-store:/home/rocketmq/store
+      - rocketmq-logs:/home/rocketmq/logs
+      - ./deploy/rocketmq/broker.conf:/etc/rocketmq/broker.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "_JAVA_OPTIONS='-Xms64m -Xmx128m -Xmn32m' sh mqadmin clusterList -n rocketmq-namesrv:9876 | grep -q broker-a"]
+      interval: 15s
+      timeout: 15s
+      retries: 20
+      start_period: 30s
+
+  rocketmq-init:
+    image: apache/rocketmq:5.5.0
+    restart: "no"
+    environment:
+      _JAVA_OPTIONS: "-Xms64m -Xmx128m -Xmn32m -Duser.timezone=Asia/Shanghai"
+      TZ: Asia/Shanghai
+    command: ["sh", "/etc/rocketmq/init-topics.sh"]
+    depends_on:
+      rocketmq-broker:
+        condition: service_healthy
+    volumes:
+      - ./deploy/rocketmq/init-topics.sh:/etc/rocketmq/init-topics.sh:ro
+
+  app:
+    image: hmdp-app:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      SERVER_PORT: "8081"
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/hmdp?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
+      SPRING_DATASOURCE_USERNAME: hmdp
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD:-123456}
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PORT: "6379"
+      SPRING_REDIS_PASSWORD: ${REDIS_PASSWORD:-123456}
+      ROCKETMQ_NAME_SERVER: rocketmq-namesrv:9876
+      HMDP_UPLOAD_PATH: /data/imgs
+      JAVA_TOOL_OPTIONS: "-Xms256m -Xmx768m -Duser.timezone=Asia/Shanghai"
+      TZ: Asia/Shanghai
+    volumes:
+      - image-data:/data/imgs
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rocketmq-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/shop-type/list >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  nginx:
+    image: hmdp-nginx:local
+    build:
+      context: .
+      dockerfile: deploy/nginx/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+    volumes:
+      - image-data:/usr/share/nginx/html/imgs:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/index.html"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mysql-data:
+  redis-data:
+  rocketmq-store:
+  rocketmq-logs:
+  image-data:

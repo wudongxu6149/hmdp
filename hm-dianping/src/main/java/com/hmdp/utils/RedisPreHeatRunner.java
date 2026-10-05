@@ -9,6 +9,7 @@ import com.hmdp.service.IVoucherOrderService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
+import org.springframework.data.geo.Point;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
@@ -20,6 +21,7 @@ import java.util.stream.Collectors;
 
 import static com.hmdp.utils.RedisConstants.CACHE_SHOP_KEY;
 import static com.hmdp.utils.RedisConstants.SECKILL_VOUCHER_KEY;
+import static com.hmdp.utils.RedisConstants.SHOP_GEO_KEY;
 import static com.hmdp.utils.RedisConstants.randomCacheTtlMinutes;
 
 @Component
@@ -59,6 +61,9 @@ public class RedisPreHeatRunner {
             // 预热通常在短时间内批量写入；随机化可以避免所有店铺在固定 30 分钟后同时进入重建流程。
             cacheClient.setWithExpireTime(
                     key, shop, randomCacheTtlMinutes(), TimeUnit.MINUTES);
+            // 新 Redis 实例也需要店铺 GEO 索引，附近查询按商铺类型读取。
+            stringRedisTemplate.opsForGeo().add(
+                    SHOP_GEO_KEY + shop.getTypeId(), new Point(shop.getX(), shop.getY()), shop.getId().toString());
         });
         log.info("已完成店铺预热");
     }

@@ -1,0 +1,14 @@
+.git
+.idea
+**/.idea
+**/target
+**/node_modules
+.env
+.env.*
+!.env.example
+nginx-1.18.0/conf
+nginx-1.18.0/logs
+nginx-1.18.0/temp
+nginx-1.18.0/docs
+nginx-1.18.0/contrib
+nginx-1.18.0/nginx.exe
